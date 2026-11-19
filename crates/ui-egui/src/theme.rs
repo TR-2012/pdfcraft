@@ -191,19 +191,22 @@ pub fn install_fonts(ctx: &egui::Context) {
 /// The interface language's claim on the CJK fallback faces.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CjkPreference {
-    /// Japanese faces first (every non-Chinese language).
+    /// Japanese faces first (every language that is not Chinese or Korean).
     #[default]
     Default,
     SimplifiedChinese,
     TraditionalChinese,
+    /// Korean faces before the Japanese ones.
+    Korean,
 }
 
 impl CjkPreference {
-    /// The preference for a UI language code (`zh-hans`, `zh-hant`, anything else).
+    /// The preference for a UI language code (`zh-hans`, `zh-hant`, `ko`, anything else).
     pub fn for_language(code: &str) -> Self {
         match code {
             "zh-hans" => Self::SimplifiedChinese,
             "zh-hant" => Self::TraditionalChinese,
+            "ko" => Self::Korean,
             _ => Self::Default,
         }
     }
@@ -245,7 +248,25 @@ fn installed_fallback_need(cjk: CjkPreference, has_embedded_hans: bool) -> crate
         CjkPreference::SimplifiedChinese if has_embedded_hans => Need::Other,
         CjkPreference::SimplifiedChinese => Need::Hans,
         CjkPreference::TraditionalChinese => Need::Hant,
-        CjkPreference::Default => Need::Other,
+        CjkPreference::Default | CjkPreference::Korean => Need::Other,
+    }
+}
+
+/// Moves the Korean craft-fonts faces ahead of the other CJK faces in every family, for a Korean
+/// interface. Only a Korean face has Hangul, but Hanja and CJK punctuation (、 。 「 」) are in the
+/// Japanese faces too: egui draws each character with the first face that has it, so with the
+/// Japanese faces first one Korean line would be drawn from two faces with different metrics.
+fn put_korean_faces_before_other_cjk(fonts: &mut FontDefinitions) {
+    let korean: Vec<String> = pdfcraft_fonts::ui_korean_fonts().iter().map(|f| f.name()).collect();
+    let other_cjk: Vec<String> = pdfcraft_fonts::ui_cjk_fonts(false).iter().map(|f| f.name()).collect();
+    if korean.is_empty() {
+        return;
+    }
+    for stack in fonts.families.values_mut() {
+        let (moved, mut kept): (Vec<String>, Vec<String>) = std::mem::take(stack).into_iter().partition(|name| korean.contains(name));
+        let first_other_cjk = kept.iter().position(|name| other_cjk.contains(name)).unwrap_or(kept.len());
+        kept.splice(first_other_cjk..first_other_cjk, moved);
+        *stack = kept;
     }
 }
 
@@ -269,8 +290,10 @@ fn installed_fallback_need(cjk: CjkPreference, has_embedded_hans: bool) -> crate
 ///
 /// `PDFCRAFT_SYSTEM_FONTS=0` leaves them out.
 pub fn installed_font_definitions(cjk: CjkPreference) -> FontDefinitions {
-    #[cfg_attr(target_arch = "wasm32", expect(unused_mut))]
     let mut fonts = font_definitions_for(cjk == CjkPreference::SimplifiedChinese);
+    if cjk == CjkPreference::Korean {
+        put_korean_faces_before_other_cjk(&mut fonts);
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         use crate::system_fonts::{Need, fallback};
@@ -382,11 +405,13 @@ fn font_definitions_for_platform(prefer_hans: bool, platform: FontPolicyPlatform
             fonts.families.entry(family).or_default().push(name.clone());
         }
     }
-    // Arabic-script faces (file names, document titles), Telugu faces (the Telugu interface,
-    // file names), Hebrew faces (file names, text being edited), Thai faces and Devanagari faces
-    // (the Hindi interface) after the CJK ones; the ranges don't overlap.
-    for face in pdfcraft_fonts::ui_arabic_fonts()
+    // Korean faces (the Korean interface, file names) right after the Japanese and Chinese ones,
+    // which have no Hangul. Then Arabic-script faces (file names, document titles), Telugu faces
+    // (the Telugu interface, file names), Hebrew faces (file names, text being edited), Thai faces
+    // and Devanagari faces (the Hindi interface); those ranges don't overlap.
+    for face in pdfcraft_fonts::ui_korean_fonts()
         .into_iter()
+        .chain(pdfcraft_fonts::ui_arabic_fonts())
         .chain(pdfcraft_fonts::ui_telugu_fonts())
         .chain(pdfcraft_fonts::ui_hebrew_fonts())
         .chain(pdfcraft_fonts::ui_thai_fonts())

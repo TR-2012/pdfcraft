@@ -147,7 +147,10 @@ impl TextBox {
         };
         let latin = !self.font.as_ref().is_some_and(|enc| can_show(enc, false));
         let font = self.font.as_ref().filter(|enc| can_show(enc, latin)).unwrap_or(&FontText::WinAnsi);
-        let width_of = |t: &str, size: f64| shaped_text::fallback_width(t, size, false, latin, |s, size| font.width(s, size));
+        // Korean and Japanese the field's font can't hold are measured as the appearance draws
+        // them: from the craft-fonts faces.
+        let cjk = latin && shown.chars().any(shaped_text::cjk_fallback);
+        let width_of = |t: &str, size: f64| shaped_text::fallback_width(t, size, false, latin, cjk, |s, size| font.width(s, size));
         // The smallest an automatic size goes ([`auto_text_size_by`]).
         let size = self.size.unwrap_or(4.0);
         if self.multiline {
@@ -769,14 +772,18 @@ pub fn value_overflow(doc: &Document, f: &Field, w: &Widget) -> Option<Overflow>
 
 /// Whether `text` draws in widget `wd` of `f` with no `?`, as [`field_appearance_fit`] picks: in
 /// the field's `/DR` font when that holds it, or else in that font or the Helvetica (WinAnsi)
-/// stand-in with the bundled Inter face drawing the Latin, Greek and Cyrillic they lack.
+/// stand-in with the bundled Inter face drawing the Latin, Greek and Cyrillic they lack, and the
+/// Korean and Japanese craft-fonts faces theirs where the appearance draws them (a text field or a
+/// combo box that isn't a comb).
 fn draws(doc: &Document, f: &Field, wd: &Dict, text: &str) -> bool {
     let da = parse_da(wd.get(b"DA").and_then(|o| doc.resolve(o).as_string().map(|s| s.to_text())).as_deref().unwrap_or(&f.da));
     let dr = dr_font(doc, &da.font).map(|(_, enc)| enc);
     if let Some(enc) = dr.as_ref().filter(|enc| enc.can_encode(text)) {
         return enc.first_unencodable(text).is_none();
     }
-    let rest: String = text.chars().filter(|c| !shaped_text::latin_fallback(*c)).collect();
+    let draws_cjk = matches!(f.kind, FieldKind::Text | FieldKind::Combo) && !f.is_comb();
+    let from_a_fallback_face = |c: char| shaped_text::latin_fallback(c) || (draws_cjk && shaped_text::cjk_fallback(c));
+    let rest: String = text.chars().filter(|c| !from_a_fallback_face(*c)).collect();
     let enc = dr.filter(|enc| enc.can_encode(&rest)).unwrap_or(FontText::WinAnsi);
     enc.first_unencodable(&rest).is_none()
 }
@@ -849,7 +856,13 @@ fn field_appearance_fit(doc: &Document, f: &Field, w: &Widget, values: &[String]
         && text.chars().any(shaped_text::is_thai)
         && !dr.as_ref().is_some_and(|(_, enc)| matches!(enc, FontText::Simple(_)) && can_show(enc, &text, false))
         && shaped_text::thai_refusal(&text).is_none();
-    let latin_text: String = if thai { text.chars().filter(|c| !shaped_text::is_thai(*c)).collect() } else { text.clone() };
+    // Korean and Japanese the form's font can't hold are drawn from the craft-fonts faces in the
+    // same way, in the same kinds of field.
+    let cjk = matches!(f.kind, FieldKind::Text | FieldKind::Combo)
+        && !f.is_comb()
+        && text.chars().any(shaped_text::cjk_fallback)
+        && !dr.as_ref().is_some_and(|(_, enc)| can_show(enc, &text, false));
+    let latin_text: String = text.chars().filter(|c| !(thai && shaped_text::is_thai(*c)) && !(cjk && shaped_text::cjk_fallback(*c))).collect();
     // Latin, Greek and Cyrillic the form's font can't hold, nor Helvetica, are drawn from the
     // bundled Inter face in the same way, beside the font that draws the rest (#6822): the value is
     // stored as typed either way, and this keeps its appearance from showing `?`.
@@ -859,7 +872,11 @@ fn field_appearance_fit(doc: &Document, f: &Field, w: &Widget, values: &[String]
         None => ("Helv".to_string(), helvetica(), FontText::WinAnsi),
     };
     let width_of = |text: &str, size: f64| {
-        if thai || latin { shaped_text::fallback_width(text, size, thai, latin, |s, size| enc.width(s, size)) } else { enc.width(text, size) }
+        if thai || latin || cjk {
+            shaped_text::fallback_width(text, size, thai, latin, cjk, |s, size| enc.width(s, size))
+        } else {
+            enc.width(text, size)
+        }
     };
     // How far a line's ink reaches below and above its baseline (em), where Thai stacks or
     // descenders reach past the form font's (Helvetica's) -0.207 and 0.718; `None` otherwise.
@@ -978,7 +995,7 @@ fn field_appearance_fit(doc: &Document, f: &Field, w: &Widget, values: &[String]
             }
         }
     }
-    let (body, fonts, unencodable) = draw_lines(&shown, size, &font_name, font_obj, &enc, thai, latin);
+    let (body, fonts, unencodable) = draw_lines(&shown, size, &font_name, font_obj, &enc, FallbackFaces { thai, latin, cjk });
     // Acrobat regenerates only what is inside /Tx BMC when it redraws a field (e.g. on focus
     // changes), discarding what came before it (issues #1613, #633). The background and border
     // therefore go inside the marked-content block too, so a redraw keeps them with the text.
@@ -1007,25 +1024,34 @@ fn field_appearance_fit(doc: &Document, f: &Field, w: &Widget, values: &[String]
     (Stream::flate(d, &content), unencodable, overflow)
 }
 
+/// What a field's appearance draws from the fallback faces rather than the field's own font.
+#[derive(Clone, Copy)]
+struct FallbackFaces {
+    /// Thai, from the Thai face.
+    thai: bool,
+    /// The Latin, Greek and Cyrillic characters the standard fonts lack, from the bundled Inter face.
+    latin: bool,
+    /// Korean and Japanese, from their craft-fonts faces.
+    cjk: bool,
+}
+
 /// The text operators for the `shown` lines (where each starts, and what it says) at `size`, in
-/// the field's font `font_name` (`font`, written with `enc`); with `thai`, their Thai from the
-/// Thai face, and with `latin`, the Latin, Greek and Cyrillic characters the standard fonts lack
-/// from the bundled Inter face. Returns the font resources they use, and the first character
-/// drawn as `?` because no font here holds it, for the caller to report.
+/// the field's font `font_name` (`font`, written with `enc`), and what `faces` names from the
+/// fallback faces. Returns the font resources they use, and the first character drawn as `?`
+/// because no font here holds it, for the caller to report.
 fn draw_lines(
     shown: &[(f64, f64, String)],
     size: f64,
     font_name: &str,
     font: Object,
     enc: &FontText,
-    thai: bool,
-    latin: bool,
+    faces: FallbackFaces,
 ) -> (Vec<u8>, Dict, Option<char>) {
     let mut fonts = Dict::new();
     fonts.set(font_name.as_bytes().to_vec(), font);
     let lines: Vec<String> = shown.iter().map(|(_, _, text)| text.clone()).collect();
-    let (pieces, shaped) = if thai || latin {
-        shaped_text::fallback_appearance_lines(&lines, thai, latin, &mut fonts)
+    let (pieces, shaped) = if faces.thai || faces.latin || faces.cjk {
+        shaped_text::fallback_appearance_lines(&lines, faces.thai, faces.latin, faces.cjk, &mut fonts)
     } else {
         (lines.into_iter().map(|l| vec![Piece::Latin(l)]).collect(), ShapedFonts::default())
     };

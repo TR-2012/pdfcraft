@@ -10150,6 +10150,60 @@ trailer << /Root 1 0 R >>
     }
 }
 
+/// A Korean CID font that isn't embedded (Adobe-Korea1, as `HYGoThic-Medium` with `UniKS-UCS2-H`)
+/// drew nothing in an export or a print: only the on-screen viewer had an installed face for it.
+/// With a Korean craft-fonts face (NanumGothic) it now draws with the default configuration, the
+/// one exports use; without one, nothing changes.
+#[test]
+fn non_embedded_korean_cid_fonts_draw_with_a_craft_fonts_face() {
+    if pdfcraft_fonts::document_korean_font().is_none() {
+        eprintln!("built without a Korean craft-fonts face (CRAFT_FONTS_DIR unset): no Korean face to check");
+        return;
+    }
+    // 한글 in UCS-2.
+    let content = "BT /F1 40 Tf 5 15 Td <D55CAE00> Tj ET";
+    for base_font in ["HYGoThic-Medium", "HYSMyeongJo-Medium"] {
+        let pdf = format!(
+            "%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 100 60] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj
+4 0 obj << /Length {} >> stream
+{content}
+endstream endobj
+5 0 obj << /Type /Font /Subtype /Type0 /BaseFont /{base_font} /Encoding /UniKS-UCS2-H /DescendantFonts [6 0 R] >> endobj
+6 0 obj << /Type /Font /Subtype /CIDFontType0 /BaseFont /{base_font} /CIDSystemInfo << /Registry (Adobe) /Ordering (Korea1) /Supplement 2 >>
+  /FontDescriptor 7 0 R /DW 1000 >> endobj
+7 0 obj << /Type /FontDescriptor /FontName /{base_font} /Flags 6 /FontBBox [0 -141 1000 859] /ItalicAngle 0 /Ascent 859 /Descent -141 /CapHeight 700 /StemV 80 >> endobj
+trailer << /Root 1 0 R >>
+%%EOF",
+            content.len()
+        );
+        // The default configuration has no installed fonts: what is drawn here may be saved.
+        let mut r = PageRenderer::new(Arc::new(pdf.into_bytes()), RenderConfig::default());
+        let p = r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0, ..Default::default() });
+        assert!(p.error.is_none(), "{base_font}: {:?}", p.error);
+        let inked = p.rgba.as_chunks::<4>().0.iter().filter(|c| c[0] < 128).count();
+        // 한글 at 40 pt covers a few hundred dark pixels; a blank or missing-glyph run doesn't.
+        assert!(inked > 300, "{base_font}: 한글 is drawn ({inked} dark pixels)");
+    }
+}
+
+/// The Korean substitute follows the font's name before its descriptor: Hancom and Acrobat set the
+/// serif flag on Gothic fonts too, so `HYGoThic-Medium` must not turn into a Myeongjo face.
+#[test]
+fn korean_font_names_pick_myeongjo_or_gothic() {
+    use super::korean_font_is_serif;
+    for name in ["HYSMyeongJo-Medium", "Batang", "BatangChe", "Gungsuh", "NanumMyeongjo"] {
+        assert!(korean_font_is_serif(name, false), "{name} is serif whatever its flags say");
+    }
+    for name in ["HYGoThic-Medium", "Dotum", "GulimChe", "MalgunGothic"] {
+        assert!(!korean_font_is_serif(name, true), "{name} is not serif whatever its flags say");
+    }
+    assert!(korean_font_is_serif("SomeKoreanFont", true));
+    assert!(!korean_font_is_serif("SomeKoreanFont", false));
+}
+
 // #3601: UniJIS-UCS2-HW-H maps code 0x0020 to CID 231 / U+2002. The PDF's
 // explicit 500-unit width must win over the substitute's ordinary-space width.
 fn japanese_spacing_pdf(content: &str, widths: &str) -> Vec<u8> {
@@ -11062,7 +11116,7 @@ mod gbk_glyphs;
 
 /// Chinese and Korean CID fonts that aren't embedded (Adobe-CNS1 `MSung-Light`, Adobe-GB1
 /// `STSong-Light`, Adobe-Korea1 `HYGoThic-Medium`; Acrobat also writes Japanese `KozGoPr6N`
-/// text boxes without the font) drew nothing, because craft-fonts has only Japanese faces.
+/// text boxes without the font) drew nothing where the build has no craft-fonts face for them.
 /// They now draw in a face already installed on the machine, read at runtime. A machine
 /// without such a face draws nothing, as before, so each check is skipped there.
 #[test]
@@ -11086,6 +11140,13 @@ fn non_embedded_chinese_and_korean_cid_fonts_draw_with_an_installed_face() {
         ("ABCDEF+FZFSK--GBK1-0", CidFamily::AdobeGB1, "GB1", "GBK-EUC-H", "D6D0CEC4", "CIDFontType2"),
     ];
     for (base_font, family, ordering, encoding, code, subtype) in cases {
+        // A Korean craft-fonts face is drawn before any installed one, exports included
+        // (`non_embedded_korean_cid_fonts_draw_with_a_craft_fonts_face`), so there is no
+        // installed-face behaviour to check for Korean in such a build.
+        if ordering == "Korea1" && pdfcraft_fonts::document_korean_font().is_some() {
+            eprintln!("{base_font}: this build has a Korean craft-fonts face: skipped");
+            continue;
+        }
         let query = FontQuery::Fallback(FallbackFontQuery {
             post_script_name: Some(base_font.into()),
             character_collection: Some(CharacterCollection { family, supplement: 2 }),

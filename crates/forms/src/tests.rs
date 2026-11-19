@@ -1115,7 +1115,8 @@ fn japanese_choices_use_the_unicode_cid_font() {
     set_value(&mut doc, "era", &FieldValue::Text("令".into())).unwrap();
     set_value(&mut doc, "address", &FieldValue::Text("日本語のテキスト入力欄です".into())).unwrap();
     // An Identity-H subset can't be addressed by Unicode: Helvetica stands in, and can't draw 令.
-    // The value is kept, drawn as `??`, marked, and other viewers are asked to redraw the form.
+    // A build with a Japanese craft-fonts face draws 令和 from that face beside it. Without one the
+    // value is kept, drawn as `??`, marked, and other viewers are asked to redraw the form.
     set_value(&mut doc, "subset", &FieldValue::Text("令和".into())).unwrap();
     let doc = reopen(&doc);
     let all = fields(&doc);
@@ -1140,10 +1141,17 @@ fn japanese_choices_use_the_unicode_cid_font() {
     assert!(addr_text.matches(" Tj").count() >= 4, "{addr_text}");
     assert!(addr.windows(4).any(|x| x == utf16("日本").as_slice()));
     let (sub, sub_fonts) = raw("subset");
+    assert_eq!(field(&all, "subset").value, ["令和"]);
+    if "令和".chars().all(pdfcraft_fonts::shaped_text::cjk_fallback) {
+        let sub = String::from_utf8_lossy(&sub);
+        assert!(!sub.contains('?') && sub.contains("/PCCj1 "), "{sub}");
+        assert_eq!(sub_fonts, ["Helv", "PCCj1"]);
+        assert!(undrawn_fields(&doc).is_empty() && !need_appearances(&doc), "nothing is left for another viewer to redraw");
+        return;
+    }
     assert!(String::from_utf8_lossy(&sub).contains("/Helv "), "{}", String::from_utf8_lossy(&sub));
     assert!(sub.windows(4).any(|x| x == b"(??)"), "{}", String::from_utf8_lossy(&sub));
     assert_eq!(sub_fonts, ["Helv"]);
-    assert_eq!(field(&all, "subset").value, ["令和"]);
     // Only that widget is marked: the CID fonts drew theirs.
     assert_eq!(undrawn_fields(&doc), [("subset".to_string(), '令')]);
     assert!(need_appearances(&doc));
@@ -1163,7 +1171,7 @@ fn text_a_field_font_cannot_hold_is_kept_marked_and_redrawn_elsewhere() {
         "<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /UniGB-UCS2-H /DescendantFonts [<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 4 >> >>] >>".into(),
         "<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /DA (/Helv 10 Tf 0 g) /V (Ada) /Rect [50 700 200 715] /P 3 0 R >>".into(),
         "<< /Type /Annot /Subtype /Widget /FT /Tx /T (cn) /DA (/CN 10 Tf 0 g) /Rect [50 600 200 615] /P 3 0 R >>".into(),
-        "<< /Type /Annot /Subtype /Widget /FT /Ch /T (city) /Ff 131072 /DA (/Helv 10 Tf 0 g) /Opt [(Zurich) <FEFF5317004E4EAC>] /Rect [50 500 200 515] /P 3 0 R >>".into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Ch /T (city) /Ff 131072 /DA (/Helv 10 Tf 0 g) /Opt [(Zurich) <FEFF0540004E0575>] /Rect [50 500 200 515] /P 3 0 R >>".into(),
     ];
     let mut doc = document(&objs);
     let shown = |doc: &Document, name: &str| {
@@ -1174,17 +1182,18 @@ fn text_a_field_font_cannot_hold_is_kept_marked_and_redrawn_elsewhere() {
         let mark = doc.get(w.obj).as_dict().and_then(pdfcraft_fonts::undrawn_mark);
         (String::from_utf8_lossy(&s.decoded().unwrap()).into_owned(), mark)
     };
-    // A WinAnsi field: the Chinese value is kept and marked; Helvetica draws `?` for it.
+    // A WinAnsi field: the Armenian value is kept and marked; Helvetica draws `?` for it. (No
+    // build has a face for Armenian; Korean and Japanese are drawn where the build has theirs.)
     assert!(!need_appearances(&doc));
-    set_value(&mut doc, "name", &FieldValue::Text("签名 Ada".into())).unwrap();
-    assert_eq!(field(&fields(&doc), "name").value, ["签名 Ada"]);
+    set_value(&mut doc, "name", &FieldValue::Text("Հյ Ada".into())).unwrap();
+    assert_eq!(field(&fields(&doc), "name").value, ["Հյ Ada"]);
     let (ap, mark) = shown(&doc, "name");
     assert!(ap.contains("(?? Ada) Tj"), "{ap}");
-    assert_eq!(mark, Some('签'));
+    assert_eq!(mark, Some('Հ'));
     assert!(need_appearances(&doc), "other viewers are asked to redraw the form");
     // A choice whose label Helvetica can't draw, the same way.
-    set_value(&mut doc, "city", &FieldValue::Text("北N京".into())).unwrap();
-    assert_eq!(shown(&doc, "city").1, Some('北'));
+    set_value(&mut doc, "city", &FieldValue::Text("ՀNյ".into())).unwrap();
+    assert_eq!(shown(&doc, "city").1, Some('Հ'));
     // A UCS-2 CMap holds 签, so nothing is marked, but not a character beyond U+FFFF.
     set_value(&mut doc, "cn", &FieldValue::Text("签名".into())).unwrap();
     assert_eq!(shown(&doc, "cn").1, None);
@@ -1193,7 +1202,7 @@ fn text_a_field_font_cannot_hold_is_kept_marked_and_redrawn_elsewhere() {
     assert_eq!(shown(&doc, "cn").1, Some('𠀋'));
     let mut undrawn = undrawn_fields(&doc);
     undrawn.sort();
-    assert_eq!(undrawn, [("city".to_string(), '北'), ("cn".to_string(), '𠀋'), ("name".to_string(), '签')]);
+    assert_eq!(undrawn, [("city".to_string(), 'Հ'), ("cn".to_string(), '𠀋'), ("name".to_string(), 'Հ')]);
     // Drawable text clears the mark; a line break in a single-line value is a space, not `?`.
     set_value(&mut doc, "name", &FieldValue::Text("Ada\nLovelace".into())).unwrap();
     let (ap, mark) = shown(&doc, "name");
@@ -1201,8 +1210,59 @@ fn text_a_field_font_cannot_hold_is_kept_marked_and_redrawn_elsewhere() {
     assert_eq!(mark, None);
     // Kept through a save.
     let doc = reopen(&doc);
-    assert_eq!(field(&fields(&doc), "city").value, ["北N京"]);
+    assert_eq!(field(&fields(&doc), "city").value, ["ՀNյ"]);
     assert!(need_appearances(&doc));
+}
+
+/// Korean and Japanese typed into a field whose `/DA` font (Helvetica, WinAnsi) can't hold them
+/// are drawn from their craft-fonts faces, as Thai is: Type 3 glyphs with a ToUnicode map beside
+/// the field's font, which draws the rest. The `/DA` is kept, nothing is marked and other viewers
+/// aren't asked to redraw. A build without those faces keeps the value and marks the field.
+#[test]
+fn korean_and_japanese_a_field_font_cannot_hold_are_drawn_from_their_faces() {
+    let objs: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 600 800] >>".into(),
+        "<< /Type /Page /Parent 2 0 R /Annots [6 0 R 7 0 R] >>".into(),
+        "<< /Fields [6 0 R 7 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 5 0 R >> >> >>".into(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /DA (/Helv 12 Tf 0 g) /V (Ada) /Rect [50 700 350 720] /P 3 0 R >>".into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (note) /Ff 4096 /DA (/Helv 12 Tf 0 g) /Rect [50 400 350 500] /P 3 0 R >>".into(),
+    ];
+    let mut doc = document(&objs);
+    let typed = "이름: 홍길동 テスト 日本語";
+    let drawn = |c: char| pdfcraft_fonts::shaped_text::cjk_fallback(c);
+    if !typed.chars().any(drawn) {
+        set_value(&mut doc, "name", &FieldValue::Text(typed.into())).unwrap();
+        assert_eq!(field(&fields(&doc), "name").value, [typed]);
+        assert_eq!(undrawn_fields(&doc), [("name".to_string(), '이')]);
+        return;
+    }
+    if !typed.chars().filter(|c| !c.is_ascii()).all(drawn) {
+        eprintln!("skipping: the craft-fonts checkout has only one of the Korean and Japanese faces");
+        return;
+    }
+    set_value(&mut doc, "name", &FieldValue::Text(typed.into())).unwrap();
+    set_value(&mut doc, "note", &FieldValue::Text(format!("{typed}\n둘째 줄"))).unwrap();
+    let doc = reopen(&doc);
+    assert!(undrawn_fields(&doc).is_empty() && !need_appearances(&doc));
+    for name in ["name", "note"] {
+        let all = fields(&doc);
+        let w = &field(&all, name).widgets[0];
+        let wd = doc.get(w.obj).as_dict().unwrap().clone();
+        assert!(wd.get(b"DA").and_then(|o| o.as_string()).is_some_and(|s| s.to_text().starts_with("/Helv ")), "the /DA is kept");
+        let n = wd.get(b"AP").unwrap().as_dict().unwrap().reference(b"N").unwrap();
+        let Object::Stream(s) = &*doc.get(n) else { panic!() };
+        let ap = String::from_utf8_lossy(&s.decoded().unwrap()).into_owned();
+        assert!(!ap.contains('?') && ap.contains("/PCCj1 ") && ap.contains("(: ) Tj"), "{name}: {ap}");
+        let fonts = s.dict.get(b"Resources").and_then(|r| r.as_dict()).and_then(|r| r.get(b"Font")).and_then(|f| f.as_dict()).unwrap();
+        let font = fonts.get(b"PCCj1").and_then(|f| f.as_dict()).unwrap();
+        assert_eq!(font.name(b"Subtype"), Some(&b"Type3"[..]));
+        let Object::Stream(cmap) = &*doc.get(font.reference(b"ToUnicode").unwrap()) else { panic!("ToUnicode is a stream object") };
+        let cmap = String::from_utf8_lossy(&cmap.decoded().unwrap()).into_owned();
+        // 홍 and テ copy as typed.
+        assert!(cmap.contains("<D64D>") && cmap.contains("<30C6>"), "{name}: {cmap}");
+    }
 }
 
 /// Thai typed into a field whose `/DA` font (Helvetica, WinAnsi) can't hold it is drawn from the
@@ -1332,8 +1392,8 @@ fn greek_a_field_font_cannot_hold_is_drawn_from_the_bundled_face() {
     assert!(has(&ap, &shown), "{}", String::from_utf8_lossy(&ap));
     // A character the bundled face lacks is still drawn as `?` and reported, beside drawn Greek.
     let mut doc = doc;
-    set_value(&mut doc, "greek", &FieldValue::Text("Γειά 北".into())).unwrap();
-    assert_eq!(undrawn_fields(&doc), [("greek".to_string(), '北')]);
+    set_value(&mut doc, "greek", &FieldValue::Text("Γειά Հ".into())).unwrap();
+    assert_eq!(undrawn_fields(&doc), [("greek".to_string(), 'Հ')]);
     assert!(need_appearances(&doc));
 }
 

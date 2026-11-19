@@ -108,6 +108,51 @@ fn hebrew_face(faces: &[CraftFont], bold: bool) -> Option<&CraftFont> {
     hebr().find(|f| f.style == style).or_else(|| hebr().find(|f| f.style == "Regular")).or_else(|| hebr().next())
 }
 
+/// The Korean craft-fonts faces (`Kore` or `Hang`: NanumGothic) for Korean interface text, in
+/// manifest order. Empty when built without craft-fonts or when its revision has no Korean face; a
+/// desktop build then falls back to one font already installed on the machine
+/// (`SYSTEM_HANGUL_FALLBACK`), and the web build shows replacement boxes.
+pub fn ui_korean_fonts() -> Vec<&'static CraftFont> {
+    // The interface is set in a sans face (Inter), so the Gothic faces lead.
+    korean_faces(CRAFT_FONTS, false, false)
+}
+
+/// The faces for Korean text written into PDFs and for PDFs that don't embed their Korean font,
+/// best match first: a Myeongjo (serif) face for serif text and a Gothic one otherwise, in the
+/// asked weight, then that kind's Regular, then the other kind. A build input with only one kind
+/// (the pinned craft-fonts has NanumGothic alone) still answers with it. Empty without craft-fonts
+/// or without a Korean face. No synthetic weight or slant is applied.
+pub fn document_korean_fonts_for_style(serif: bool, bold: bool) -> Vec<&'static CraftFont> {
+    korean_faces(CRAFT_FONTS, serif, bold)
+}
+
+/// The Gothic Regular Korean face, or whichever Korean face the build has. `None` without one.
+pub fn document_korean_font() -> Option<&'static CraftFont> {
+    document_korean_fonts_for_style(false, false).into_iter().next()
+}
+
+fn is_korean_face(face: &CraftFont) -> bool {
+    face.covers("Kore") || face.covers("Hang")
+}
+
+/// Lower-case pieces of a Korean family name that mark a serif face (명조, 바탕, 궁서).
+const KOREAN_SERIF_FAMILY_HINTS: [&str; 4] = ["myeongjo", "myungjo", "batang", "gungsuh"];
+
+/// Whether a Korean family name (a craft-fonts family or a PDF's `/BaseFont`) names a serif face.
+pub fn is_korean_serif_family(family: &str) -> bool {
+    let family = family.to_ascii_lowercase();
+    KOREAN_SERIF_FAMILY_HINTS.iter().any(|hint| family.contains(hint))
+}
+
+fn korean_faces(faces: &[CraftFont], serif: bool, bold: bool) -> Vec<&CraftFont> {
+    let asked_style = if bold { "Bold" } else { "Regular" };
+    let mut out: Vec<&CraftFont> = faces.iter().filter(|f| is_korean_face(f)).collect();
+    // Stable: the asked kind before the other, and within a kind the asked weight, then Regular,
+    // then manifest order.
+    out.sort_by_key(|f| (is_korean_serif_family(f.family) != serif, f.style != asked_style, f.style != "Regular"));
+    out
+}
+
 /// Interface CJK faces in fallback order for the UI language: Simplified Chinese first when
 /// `prefer_hans`, otherwise Japanese first (the historical default).
 ///
@@ -295,6 +340,35 @@ mod tests {
         // An Arabic face is never a CJK fallback, and the other way round.
         assert!(order_cjk(&faces, false).iter().all(|f| f.family == "BIZ UDPGothic"));
         assert_eq!(ui_arabic_fonts().len(), CRAFT_FONTS.iter().filter(|f| f.covers("Arab")).count());
+    }
+
+    #[test]
+    fn korean_faces_are_picked_by_script_and_follow_the_weight() {
+        // Synthetic faces: the filter must not depend on the real build input.
+        static HANG_KORE: &[&str] = &["Hang", "Kore"];
+        static KORE: &[&str] = &["Kore"];
+        static JPAN: &[&str] = &["Jpan"];
+        let faces = [
+            CraftFont { family: "BIZ UDPGothic", style: "Regular", scripts: JPAN, bytes: b"japanese" },
+            CraftFont { family: "FakeGothic", style: "Bold", scripts: KORE, bytes: b"gothic-bold" },
+            CraftFont { family: "FakeGothic", style: "Regular", scripts: HANG_KORE, bytes: b"gothic" },
+            CraftFont { family: "FakeMyeongjo", style: "Regular", scripts: HANG_KORE, bytes: b"myeongjo" },
+        ];
+        let order = |faces, serif, bold| korean_faces(faces, serif, bold).iter().map(|f| f.bytes).collect::<Vec<&[u8]>>();
+        assert_eq!(order(&faces, false, false), [b"gothic".as_slice(), b"gothic-bold", b"myeongjo"]);
+        assert_eq!(order(&faces, false, true), [b"gothic-bold".as_slice(), b"gothic", b"myeongjo"]);
+        // Serif text takes the Myeongjo face; a weight it lacks stays Myeongjo rather than turn Gothic.
+        assert_eq!(order(&faces, true, false), [b"myeongjo".as_slice(), b"gothic", b"gothic-bold"]);
+        assert_eq!(order(&faces, true, true), [b"myeongjo".as_slice(), b"gothic-bold", b"gothic"]);
+        // A build with one kind answers with it, and a Japanese face is never a Korean one.
+        assert_eq!(order(&faces[2..3], true, true), [b"gothic".as_slice()]);
+        assert!(korean_faces(&faces[..1], false, false).is_empty());
+        assert!(["NanumMyeongjo", "HYSMyeongJo-Medium", "AppleMyungjo", "Batang", "Gungsuh"].iter().all(|name| is_korean_serif_family(name)));
+        assert!(!["NanumGothic", "HYGoThic-Medium", "Malgun Gothic", "Dotum", "Gulim"].iter().any(|name| is_korean_serif_family(name)));
+        // Holds with or without CRAFT_FONTS_DIR.
+        let real = CRAFT_FONTS.iter().filter(|f| f.covers("Kore") || f.covers("Hang")).count();
+        assert_eq!(ui_korean_fonts().len(), real);
+        assert_eq!(document_korean_font().is_some(), real > 0);
     }
 
     #[test]

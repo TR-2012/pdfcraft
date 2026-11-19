@@ -223,6 +223,43 @@ mod tests {
         assert!(shows([-1.0, -1.0, 1.0, 1.0], &clip));
     }
 
+    /// Japanese puts no space between a word and its brackets. Filling in two brackets on one row
+    /// must leave the word between them in its own run, and so in its own font: it used to count as
+    /// typed anew and take the brackets' run, whose font cannot draw it.
+    #[test]
+    fn a_cjk_word_between_two_edits_keeps_its_own_run() {
+        let runs = ["愛情", "（\u{3000}\u{3000}） ", "表現", "（\u{3000}\u{3000}）"];
+        let mut block = block(&runs.concat(), [0.0; 4]);
+        let mut start = 0;
+        for (index, run) in runs.iter().enumerate() {
+            block.lines.push(index);
+            block.spans.push((start..start + run.len(), index));
+            start += run.len();
+        }
+        let draft = "愛情（애정） 表現（표현）";
+        let spans = block.edited_spans(draft);
+        let run_of = |word: &str| {
+            let at = draft.find(word).unwrap();
+            spans.iter().find(|(range, _)| range.contains(&at)).map(|(_, run)| *run)
+        };
+        assert_eq!(run_of("愛情"), Some(0));
+        assert_eq!(run_of("表現"), Some(2), "an untouched word between two edits keeps its run");
+        assert_eq!(run_of("애정"), Some(1), "typed text takes the run it was typed into");
+        assert_eq!(run_of("표현"), Some(3));
+    }
+
+    /// Korean serif families are serif: text typed into a Batang run takes a Mincho fallback, not
+    /// a Gothic one.
+    #[test]
+    fn korean_serif_family_names_take_a_serif_fallback() {
+        for name in ["INPILL+HCRBatang", "Batang", "HYSMyeongJo-Medium", "AppleMyungjo", "Gungsuh"] {
+            assert!(source_family(name) == crate::added::Family::Times, "{name} is a serif family");
+        }
+        for name in ["MalgunGothic", "NanumGothic", "Dotum", "Gulim"] {
+            assert!(source_family(name) == crate::added::Family::Helvetica, "{name} is not a serif family");
+        }
+    }
+
     fn block(text: &str, rect: [f64; 4]) -> TextBlock {
         TextBlock {
             text: text.into(),

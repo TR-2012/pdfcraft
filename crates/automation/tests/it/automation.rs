@@ -5472,9 +5472,16 @@ fn creating_from_text_refuses_what_the_font_cannot_draw() {
     // WinAnsi characters, line breaks and tabs are still fine.
     let d = ok(&mut a, "doc_create", json!({ "from": "text", "text": "Price: 5 € at café\r\n\tnext\u{c}page two" }))["doc"].as_u64().unwrap();
     assert_eq!(page_text(&mut a, d).len(), 2);
-    // #959: page_add_text refuses it too.
+    // #959: page_add_text refuses it too, unless the build has a Korean craft-fonts face: then the
+    // text is drawn with that face and reads back as typed.
     let doc = ok(&mut a, "doc_create", json!({ "from": "blank" }))["doc"].as_u64().unwrap();
-    refused(a.call("page_add_text", &json!({ "doc": doc, "page": 1, "text": "ABC 제안서 시험", "at": [20, 20] })));
+    let korean = json!({ "doc": doc, "page": 1, "text": "ABC 제안서 시험", "at": [20, 20] });
+    if pdfcraft_fonts::document_korean_font().is_none() {
+        refused(a.call("page_add_text", &korean));
+        return;
+    }
+    ok(&mut a, "page_add_text", korean);
+    assert!(page_text(&mut a, doc).concat().contains("제안서"), "the added Korean text is searchable");
 }
 
 #[test]
