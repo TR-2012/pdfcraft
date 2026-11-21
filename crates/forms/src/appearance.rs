@@ -140,7 +140,7 @@ impl TextBox {
         // The font the appearance would choose for this text, and whether the bundled Inter face
         // draws what neither it nor Helvetica holds (as `field_appearance_fit` chooses).
         let holds = |enc: &FontText, s: &str, skip_latin: bool| {
-            if skip_latin { enc.can_encode(&s.chars().filter(|c| !shaped_text::latin_fallback(*c)).collect::<String>()) } else { enc.can_encode(s) }
+            if skip_latin { enc.can_encode(&s.chars().filter(|c| !shaped_text::fallback_draws(*c)).collect::<String>()) } else { enc.can_encode(s) }
         };
         let can_show = |enc: &FontText, skip_latin: bool| {
             if self.multiline { shown.split(['\n', '\r']).all(|l| holds(enc, l, skip_latin)) } else { holds(enc, &shown, skip_latin) }
@@ -776,7 +776,7 @@ fn draws(doc: &Document, f: &Field, wd: &Dict, text: &str) -> bool {
     if let Some(enc) = dr.as_ref().filter(|enc| enc.can_encode(text)) {
         return enc.first_unencodable(text).is_none();
     }
-    let rest: String = text.chars().filter(|c| !shaped_text::latin_fallback(*c)).collect();
+    let rest: String = text.chars().filter(|c| !shaped_text::fallback_draws(*c)).collect();
     let enc = dr.filter(|enc| enc.can_encode(&rest)).unwrap_or(FontText::WinAnsi);
     enc.first_unencodable(&rest).is_none()
 }
@@ -830,7 +830,7 @@ fn field_appearance_fit(doc: &Document, f: &Field, w: &Widget, values: &[String]
     // Whether `enc` holds what is shown; with `skip_latin`, leaving out what the bundled face draws.
     let can_show = |enc: &FontText, text: &str, skip_latin: bool| {
         let holds = |s: &str| {
-            if skip_latin { enc.can_encode(&s.chars().filter(|c| !shaped_text::latin_fallback(*c)).collect::<String>()) } else { enc.can_encode(s) }
+            if skip_latin { enc.can_encode(&s.chars().filter(|c| !shaped_text::fallback_draws(*c)).collect::<String>()) } else { enc.can_encode(s) }
         };
         if f.kind == FieldKind::List {
             f.options.iter().all(|(_, display)| holds(display))

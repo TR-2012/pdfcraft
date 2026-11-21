@@ -4764,6 +4764,114 @@ fn mixed_script_paragraph_keeps_source_fonts_through_tools_and_reopen() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Keep fonts refuses a paragraph edit that would set any text in a stand-in face, and changes
+/// nothing; without it the same edit goes ahead in Helvetica, and text the font can show keeps it.
+#[test]
+fn keep_fonts_refuses_a_paragraph_edit_that_would_substitute_a_font() {
+    let dir = workdir("keep-fonts");
+    // A subset Arial with widths (and so glyphs) for a and b only.
+    let content = "BT /F1 12 Tf 72 700 Td (ab) Tj ET";
+    let objs = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_string(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        "<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+Arial /FirstChar 97 /LastChar 99 /Widths [500 520 0] /Encoding /WinAnsiEncoding >>"
+            .to_string(),
+    ];
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        pdf.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    std::fs::write(dir.join("subset.pdf"), pdf).unwrap();
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_open", json!({"path":"subset.pdf"}))["doc"].as_u64().unwrap();
+    let font = |a: &mut Automation| ok(a, "text_lines", json!({"doc":doc,"page":1}))["lines"][0]["font"].as_str().unwrap().to_owned();
+
+    let refused = a.call("text_edit", &json!({"doc":doc,"page":1,"paragraph":1,"text":"xyz","keep_fonts":true}));
+    let message = format!("{refused:?}");
+    assert!(refused.is_err() && message.contains("Keep fonts") && message.contains("Helvetica"), "{message}");
+    assert_eq!(page_text(&mut a, doc), ["ab"], "a refused edit changes nothing");
+    assert!(font(&mut a).ends_with("Arial"));
+    assert_eq!(ok(&mut a, "doc_list", json!({}))["documents"][0]["dirty"], json!(false), "nothing unsaved after a refusal");
+
+    // Text the source font can show is still edited with Keep fonts on, in that font.
+    ok(&mut a, "text_edit", json!({"doc":doc,"page":1,"paragraph":1,"text":"ba","keep_fonts":true}));
+    assert_eq!(page_text(&mut a, doc), ["ba"]);
+    assert!(font(&mut a).ends_with("Arial"));
+
+    // Without Keep fonts the same edit goes ahead in a stand-in.
+    ok(&mut a, "text_edit", json!({"doc":doc,"page":1,"paragraph":1,"text":"xyz"}));
+    assert_eq!(page_text(&mut a, doc), ["xyz"]);
+    assert_eq!(font(&mut a), "Helvetica");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A subset Arial with glyphs for a and b only, on one page.
+fn subset_arial_pdf(dir: &std::path::Path) {
+    let content = "BT /F1 12 Tf 72 700 Td (ab) Tj ET";
+    let objs = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_string(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        "<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+Arial /FirstChar 97 /LastChar 99 /Widths [500 520 0] /Encoding /WinAnsiEncoding >>"
+            .to_string(),
+    ];
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        pdf.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    std::fs::write(dir.join("subset.pdf"), pdf).unwrap();
+}
+
+/// Hangul typed into a paragraph whose font lacks it is set in a Korean face, and the edit says
+/// which; before, it failed with "the Inter fallback font has no glyph for 듣". A character no
+/// single face has (Hangul next to kana) takes each from a face that has it.
+#[test]
+fn a_hangul_edit_takes_a_korean_face_and_says_so() {
+    let dir = workdir("hangul-edit");
+    subset_arial_pdf(&dir);
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_open", json!({"path":"subset.pdf"}))["doc"].as_u64().unwrap();
+    let args = json!({"doc":doc,"page":1,"paragraph":1,"text":"듣기 ab"});
+    let Some(korean) = pdfcraft_fonts::document_korean_fonts_for_style(false, false).first().map(|f| f.family) else {
+        eprintln!("skipping the Korean half: built without a Korean craft-fonts face (set CRAFT_FONTS_DIR to run it)");
+        let edit = a.call("text_edit", &args);
+        assert!(edit.is_err(), "no face has Hangul: {edit:?}");
+        assert_eq!(page_text(&mut a, doc), ["ab"], "a refused edit changes nothing");
+        let _ = std::fs::remove_dir_all(dir);
+        return;
+    };
+    let edit = ok(&mut a, "text_edit", args);
+    assert_eq!(page_text(&mut a, doc), ["듣기 ab"]);
+    let warnings = format!("{}", edit["warnings"]);
+    assert!(warnings.contains(&format!("set in {korean}")), "the stand-in is named: {warnings}");
+
+    // Hangul, kana and a symbol in one paragraph: each from a face that has it.
+    if !pdfcraft_fonts::document_japanese_fonts_for_style(false, false).is_empty() {
+        ok(&mut a, "text_edit", json!({"doc":doc,"page":1,"paragraph":1,"text":"듣기 テスト ①"}));
+        assert_eq!(page_text(&mut a, doc), ["듣기 テスト ①"]);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn paragraph_bold_without_font_keeps_the_source_family() {
     let dir = workdir("paragraph-bold");
@@ -5460,21 +5568,28 @@ fn creating_and_reducing_through_tools() {
 #[test]
 fn creating_from_text_refuses_what_the_font_cannot_draw() {
     let dir = workdir("create-undrawable");
+    // Ethiopic: neither Helvetica nor a bundled face has it.
+    std::fs::write(dir.join("et.txt"), "ABC ሰላም ፈተና").unwrap();
     std::fs::write(dir.join("kr.txt"), "ABC 제안서 시험").unwrap();
     let mut a = auto(&dir);
     let refused = |r: Result<Vec<Content>, ToolError>| match r {
-        Err(ToolError::InvalidArgs(m) | ToolError::Failed(m)) => assert!(m.contains("U+C81C"), "{m}"),
+        Err(ToolError::InvalidArgs(m) | ToolError::Failed(m)) => assert!(m.contains("U+1230"), "{m}"),
         other => panic!("expected a refusal, got {other:?}"),
     };
-    assert!(matches!(a.call("doc_create", &json!({ "from": "text", "text": "ABC 제안서 시험" })), Err(ToolError::InvalidArgs(_))));
-    refused(a.call("doc_create", &json!({ "from": "text", "text": "ABC 제안서 시험" })));
-    refused(a.call("doc_create", &json!({ "from": "text", "path": "kr.txt" })));
+    assert!(matches!(a.call("doc_create", &json!({ "from": "text", "text": "ABC ሰላም ፈተና" })), Err(ToolError::InvalidArgs(_))));
+    refused(a.call("doc_create", &json!({ "from": "text", "text": "ABC ሰላም ፈተና" })));
+    refused(a.call("doc_create", &json!({ "from": "text", "path": "et.txt" })));
+    // Korean is set in the Korean face where the build has one, and refused where it hasn't.
+    let korean = a.call("doc_create", &json!({ "from": "text", "path": "kr.txt" }));
+    assert_eq!(korean.is_ok(), pdfcraft_fonts::korean_has('제'), "{korean:?}");
     // WinAnsi characters, line breaks and tabs are still fine.
     let d = ok(&mut a, "doc_create", json!({ "from": "text", "text": "Price: 5 € at café\r\n\tnext\u{c}page two" }))["doc"].as_u64().unwrap();
     assert_eq!(page_text(&mut a, d).len(), 2);
     // #959: page_add_text refuses it too.
     let doc = ok(&mut a, "doc_create", json!({ "from": "blank" }))["doc"].as_u64().unwrap();
-    refused(a.call("page_add_text", &json!({ "doc": doc, "page": 1, "text": "ABC 제안서 시험", "at": [20, 20] })));
+    refused(a.call("page_add_text", &json!({ "doc": doc, "page": 1, "text": "ABC ሰላም ፈተና", "at": [20, 20] })));
+    let korean = a.call("page_add_text", &json!({ "doc": doc, "page": 1, "text": "ABC 제안서 시험", "at": [20, 20] }));
+    assert_eq!(korean.is_ok(), pdfcraft_fonts::korean_has('제'), "{korean:?}");
 }
 
 #[test]
@@ -7982,7 +8097,7 @@ fn text_the_standard_fonts_cannot_draw_is_never_silent_through_tools() {
     ok(&mut a, "fill_sign_add", json!({ "doc": doc, "page": 1, "type": "signature", "at": [20, 380], "text": "Саша" }));
     refused(&mut a, "redact_mark", json!({ "doc": doc, "page": 1, "rect": [10, 400, 190, 420], "overlay": "机密" }), "\"机\" (U+673A)");
     refused(&mut a, "doc_flatten", json!({ "doc": doc }), "nothing was flattened");
-    refused(&mut a, "doc_create", json!({ "from": "text", "text": "Notes\n第二行" }), "(line 2)");
+    refused(&mut a, "doc_create", json!({ "from": "text", "text": "Notes\nሰላም" }), "(line 2)");
     // A summary quotes the note: escaped, not refused, not `?`.
     ok(&mut a, "comments_summarize", json!({ "doc": doc, "out": "summary.pdf" }));
     let summary = ok(&mut a, "doc_open", json!({ "path": "summary.pdf" }))["doc"].as_u64().unwrap();

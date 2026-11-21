@@ -335,6 +335,8 @@ impl Session {
         if cx.redaction_identification != pdfcraft_redact::Identification::default() {
             notices.push(EditNotice::RedactionIdentification(cx.redaction_identification));
         }
+        // Text set partly in a stand-in face because its own font lacks some characters: said.
+        notices.extend(cx.substituted_font.take().map(|face| EditNotice::FontSubstituted { face: stand_in_name(&face) }));
         let previous = std::mem::replace(&mut editor.cos, next);
         let keys = keys_after(&edit).unwrap_or_else(|| editor.keys.clone());
         let previous_keys = std::mem::replace(&mut editor.keys, keys);
@@ -814,4 +816,10 @@ fn edit_notices(edit: &Edit, prev: &pdfcraft_cos::Document, next: &pdfcraft_cos:
         }
     }
     notices
+}
+
+/// A stand-in face's name as the writer knows it: `NanumGothic Type3` (the generated font's
+/// description) is `NanumGothic`.
+fn stand_in_name(face: &str) -> String {
+    face.strip_suffix(" Type3").unwrap_or(face).to_string()
 }

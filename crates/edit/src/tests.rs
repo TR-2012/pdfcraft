@@ -2795,12 +2795,20 @@ fn japanese_replacement_missing_a_glyph_after_240_changes_nothing() {
     if without_craft_fonts("japanese_replacement_missing_a_glyph_after_240_changes_nothing") {
         return;
     }
-    // The first CJK character that no face draws: the 242nd unique character, in a second font.
-    let faces = pdfcraft_fonts::document_japanese_fonts_for_style(false, false);
+    // The first character that no face draws (a CJK one, else Ethiopic): the 242nd unique
+    // character, in a second font. Every face a replacement may take a character from counts.
+    let faces: Vec<_> = pdfcraft_fonts::document_japanese_fonts_for_style(false, false)
+        .into_iter()
+        .chain(pdfcraft_fonts::document_latin_fonts(false))
+        .chain(pdfcraft_fonts::document_korean_fonts_for_style(false, false))
+        .chain(pdfcraft_fonts::document_chinese_fonts())
+        .chain(pdfcraft_fonts::document_symbol_fonts())
+        .collect();
     let missing = (0x4E00u32..0x9FFF)
+        .chain(0x1200..0x137F)
         .filter_map(char::from_u32)
         .find(|ch| faces.iter().all(|face| pdfcraft_fonts::japanese_glyph_from(face, *ch).is_err()))
-        .expect("some CJK character is outside every face");
+        .expect("some character is outside every face");
     let replacement = format!("{}{missing}", covered_japanese_chars(241));
     let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
     let saved = write_incremental(&doc, &SaveOptions::default()).unwrap();
@@ -7050,22 +7058,22 @@ fn thai_headers_footers_and_watermarks_are_drawn_from_the_thai_face() {
     assert_eq!(shared[0], shared[1], "every page draws with the same fonts");
 }
 
-/// #125: page-content tools refuse text the standard fonts can't draw instead of writing `?`,
-/// and leave the document untouched.
+/// #125: page-content tools refuse text no font here can draw (Ethiopic: neither the standard
+/// fonts nor a bundled face has it) instead of writing `?`, and leave the document untouched.
 #[test]
 fn page_text_the_standard_fonts_cant_draw_is_refused() {
     let mut doc = fixture();
     let before: Vec<Vec<String>> = (0..3).map(|p| streams(&reopen(&doc), p)).collect();
-    let text = AddedText { rect: [72.0, 600.0, 300.0, 700.0], text: "日本語のテキスト".into(), ..AddedText::default() };
+    let text = AddedText { rect: [72.0, 600.0, 300.0, 700.0], text: "ሰላም ለዓለም".into(), ..AddedText::default() };
     let err = add_content(&mut doc, 0, &Content::Text(text)).unwrap_err().to_string();
-    assert!(err.contains("\"日\" (U+65E5)"), "{err}");
+    assert!(err.contains("\"ሰ\" (U+1230)"), "{err}");
     let hf = HeaderFooter {
         text: ["Ελληνικά".into(), String::new(), String::new(), String::new(), String::new(), String::new()],
         ..HeaderFooter::default()
     };
     assert!(add_header_footer(&mut doc, &[0, 1], &hf, true, &cx()).unwrap_err().to_string().contains("U+0395"));
-    let wm = Watermark { text: "机密".into(), ..Watermark::default() };
-    assert!(add_watermark(&mut doc, &[0], &wm, true).unwrap_err().to_string().contains("U+673A"));
+    let wm = Watermark { text: "ሰላ".into(), ..Watermark::default() };
+    assert!(add_watermark(&mut doc, &[0], &wm, true).unwrap_err().to_string().contains("U+1230"));
     let after: Vec<Vec<String>> = (0..3).map(|p| streams(&reopen(&doc), p)).collect();
     assert_eq!(before, after, "a refused edit changes nothing");
     // Western European text, including what only WinAnsi (not Latin-1) has, still works.
@@ -7073,8 +7081,8 @@ fn page_text_the_standard_fonts_cant_draw_is_refused() {
     add_content(&mut doc, 0, &Content::Text(text.clone())).unwrap();
     // Retyping existing text is refused the same way, and the whole document is left as it was.
     let saved = write_incremental(&doc, &SaveOptions::default()).unwrap();
-    let retyped = AddedText { text: "Café 中".into(), ..text.clone() };
-    assert!(update_content(&mut doc, 0, 0, &Content::Text(retyped)).unwrap_err().to_string().contains("U+4E2D"));
+    let retyped = AddedText { text: "Café ሰ".into(), ..text.clone() };
+    assert!(update_content(&mut doc, 0, 0, &Content::Text(retyped)).unwrap_err().to_string().contains("U+1230"));
     assert_eq!(write_incremental(&doc, &SaveOptions::default()).unwrap(), saved, "a refused update changes nothing");
     // A carriage return is checked where it would be drawn: added text splits on LF only, so
     // CRLF would leave a `?`; headers and watermarks split CRLF into lines, but not a lone CR.
@@ -7091,13 +7099,13 @@ fn page_text_the_standard_fonts_cant_draw_is_refused() {
     let arabic = |text: &str| AddedText { rect: [72.0, 600.0, 300.0, 700.0], text: text.into(), ..AddedText::default() };
     // U+061C is in the Arabic block but is a direction mark that's dropped, not shaped: it never
     // makes text drawable, nor (with the face) undrawable.
-    assert!(add_content(&mut doc, 0, &Content::Text(arabic("\u{061C}中"))).is_err());
+    assert!(add_content(&mut doc, 0, &Content::Text(arabic("\u{061C}ሰ"))).is_err());
     if pdfcraft_fonts::arabic_has('م') {
         add_content(&mut doc, 0, &Content::Text(arabic("مرحبا Hello"))).unwrap();
         add_content(&mut doc, 0, &Content::Text(arabic("\u{061C}Hello"))).unwrap();
-        for text in ["مرحبا 中", "\u{061C}中"] {
+        for text in ["مرحبا ሰ", "\u{061C}ሰ"] {
             let err = add_content(&mut doc, 0, &Content::Text(arabic(text))).unwrap_err().to_string();
-            assert!(err.contains("U+4E2D"), "{text:?}: {err}");
+            assert!(err.contains("U+1230"), "{text:?}: {err}");
         }
     } else {
         // #403's own refusal says what's missing; the Add-text editor still keeps the draft.
@@ -7108,8 +7116,8 @@ fn page_text_the_standard_fonts_cant_draw_is_refused() {
         // the standard font would write as `?`.
         let n = list_added(&doc).iter().filter(|a| a.page == 0).count();
         add_content(&mut doc, 0, &Content::Text(arabic("x"))).unwrap();
-        let err = update_content(&mut doc, 0, n, &Content::Text(arabic("ب中"))).unwrap_err().to_string();
-        assert!(err.contains("U+4E2D"), "{err}");
+        let err = update_content(&mut doc, 0, n, &Content::Text(arabic("بሰ"))).unwrap_err().to_string();
+        assert!(err.contains("U+1230"), "{err}");
         update_content(&mut doc, 0, n, &Content::Text(arabic("ب"))).unwrap();
     }
 }
@@ -7601,7 +7609,7 @@ fn added_thai_text_wraps_clusters_and_survives_reopen() {
     assert_eq!(super::added::lines(&narrow), ["กิ่", "กิ่", "กิ่"]);
     update_content(&mut doc, 0, 0, &Content::Text(AddedText { text: "แก้ไข น้ำ".into(), ..t.clone() })).unwrap();
     assert!(!own(&doc, 0).is_empty());
-    let bad = Content::Text(AddedText { text: "ไทย 日".into(), ..t });
+    let bad = Content::Text(AddedText { text: "ไทย ሰ".into(), ..t });
     let before = list_added(&doc);
     assert!(update_content(&mut doc, 0, 0, &bad).is_err());
     assert_eq!(list_added(&doc), before);

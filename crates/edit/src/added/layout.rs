@@ -51,7 +51,9 @@ pub(super) fn wrapped(t: &AddedText) -> Vec<(String, bool, usize)> {
         // sum of its words' and shaping stays linear in the paragraph's length. The space is the
         // paragraph's; a space between Latin words is drawn in the item's font, a few hundredths
         // of an em apart.
-        let measure = |s: &str| if rtl_script || thai { shaped_width(t, s, rtl) } else { latin_width(t, s) };
+        // Korean and Japanese are measured as their faces draw them, too.
+        let cjk = para.chars().any(|c| pdfcraft_fonts::cjk_fallback(c).is_some());
+        let measure = |s: &str| if rtl_script || thai || cjk { shaped_width(t, s, rtl) } else { latin_width(t, s) };
         let space = measure(" ");
         let (mut line, mut line_w) = (String::new(), 0.0);
         // Widths add up (the standard-14 widths have no kerning), so each word is measured once
@@ -225,7 +227,8 @@ pub fn first_undrawable(t: &AddedText) -> Option<char> {
 /// Whether `t` has Arabic or Hebrew that its craft-fonts face draws (so `draw` lays it out with
 /// [`draw_shaped`]).
 fn shaped_by_a_face(t: &AddedText) -> bool {
-    (pdfcraft_fonts::document_arabic_font().is_some() && t.text.chars().any(is_arabic))
+    t.text.chars().any(|c| pdfcraft_fonts::cjk_fallback(c).is_some())
+        || (pdfcraft_fonts::document_arabic_font().is_some() && t.text.chars().any(is_arabic))
         || (pdfcraft_fonts::document_hebrew_font(false).is_some() && t.text.chars().any(is_hebrew))
 }
 
@@ -278,6 +281,9 @@ pub(super) fn shaped_layout(t: &AddedText, line: &str, rtl: bool) -> Result<(Vec
             let after_hebrew = segments.last().is_some_and(|(kind, _)| *kind == Some(ShapedScript::Hebrew));
             let script = if is_thai(c) {
                 Some(ShapedScript::Thai)
+            } else if let Some(cjk) = pdfcraft_fonts::cjk_fallback(c) {
+                // Hangul, kana, Han and the symbols only the Korean or Japanese face has.
+                Some(cjk)
             } else if is_hebrew(c) || (run_rtl && after_hebrew && !c.is_alphanumeric() && pdfcraft_fonts::hebrew_has(c)) {
                 Some(ShapedScript::Hebrew)
             } else if is_arabic(c) || (run_rtl && !c.is_alphanumeric() && pdfcraft_fonts::arabic_has(c)) {
@@ -299,6 +305,12 @@ pub(super) fn shaped_layout(t: &AddedText, line: &str, rtl: bool) -> Result<(Vec
                     ShapedScript::Arabic => shape_arabic(&s, run_rtl).map_err(|e| arabic_error(e, &s))?,
                     ShapedScript::Hebrew => shape_hebrew(&s, run_rtl).map_err(|e| hebrew_error(e, &s))?,
                     ShapedScript::Thai => shape_thai(&s).map_err(|e| thai_error(e, &s))?,
+                    ShapedScript::Korean => {
+                        pdfcraft_fonts::shape_korean(&s).map_err(|e| EditError::Invalid(pdfcraft_fonts::shaped_text::shaped_message(e, &s)))?
+                    }
+                    ShapedScript::Japanese => {
+                        pdfcraft_fonts::shape_japanese(&s).map_err(|e| EditError::Invalid(pdfcraft_fonts::shaped_text::shaped_message(e, &s)))?
+                    }
                     // Not a script this layout splits out; shaped as such all the same.
                     ShapedScript::Latin => {
                         pdfcraft_fonts::shape_latin(&s).map_err(|e| EditError::Invalid(pdfcraft_fonts::shaped_text::latin_message(e, &s)))?

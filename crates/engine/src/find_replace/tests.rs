@@ -149,44 +149,51 @@ fn a_match_spanning_two_paragraphs_is_skipped_and_counted() {
     assert_eq!(texts(&s, id, 0), ["The first ends here", "second starts there"]);
 }
 
-/// The subset in `F3` has glyphs for `a` and `b` only, from a face no computer has: a `c` would
-/// be drawn in Helvetica instead. That paragraph is left alone and counted, the other replaced.
+/// The subset in `F3` has glyphs for `a` and `b` only, from a face no computer has: a `c` is
+/// drawn in a stand-in face, and applying the replacement says which.
 #[test]
-fn a_character_the_font_cannot_draw_is_skipped_and_counted() {
+fn a_character_the_font_cannot_draw_is_set_in_a_stand_in_and_said() {
     let content = "BT /F3 12 Tf 72 700 Td (ab ba) Tj ET BT /F1 12 Tf 72 500 Td (ab in Helvetica) Tj ET";
     let (mut s, id) = open(pdf(content));
     let before = texts(&s, id, 0);
     assert_eq!(before, ["ab ba", "ab in Helvetica"]);
     let plan = replace_all(&mut s, id, &query("ab", "cb"));
-    assert_eq!(plan.replaced, 1);
-    assert_eq!(plan.skipped, BTreeMap::from([(Skip::MissingGlyphs, 1)]));
-    assert_eq!(texts(&s, id, 0), ["ab ba", "cb in Helvetica"]);
-    let lines = s.get(id).unwrap().text_lines(0);
-    assert!(lines.iter().filter(|l| l.text.contains("ab ba")).all(|l| l.font == "F3"), "the subset paragraph keeps its font: {lines:?}");
-    // What the subset can draw still goes in.
+    assert_eq!((plan.replaced, plan.skipped_total()), (2, 0));
+    assert_eq!(texts(&s, id, 0), ["cb ba", "cb in Helvetica"]);
+    let notices = &s.get(id).unwrap().edit_notices;
+    assert!(notices.iter().any(|n| matches!(n, crate::EditNotice::FontSubstituted { .. })), "the stand-in is said: {notices:?}");
+    // What the subset can draw still goes in, in the subset's own font.
+    let (mut s, id) = open(pdf(content));
     let plan = replace_all(&mut s, id, &query("ab ba", "ba ab"));
     assert_eq!((plan.replaced, plan.skipped_total()), (1, 0));
     assert_eq!(texts(&s, id, 0)[0], "ba ab");
+    let lines = s.get(id).unwrap().text_lines(0);
+    assert!(lines.iter().filter(|l| l.text.contains("ba ab")).all(|l| l.font == "F3"), "the subset paragraph keeps its font: {lines:?}");
 }
 
-/// The styled rewrite (a paragraph of several runs) reports the missing character as the
-/// one-style rewrite above does.
+/// The styled rewrite (a paragraph of several runs) sets the missing character in a stand-in as
+/// the one-style rewrite above does.
 #[test]
-fn a_character_the_font_cannot_draw_is_skipped_in_a_paragraph_of_several_runs() {
+fn a_character_the_font_cannot_draw_is_set_in_a_stand_in_in_a_paragraph_of_several_runs() {
     let (mut s, id) = open(pdf("BT /F3 12 Tf 72 700 Td (ab ) Tj /F1 12 Tf (and Helvetica) Tj ET"));
     let plan = replace_all(&mut s, id, &query("ab", "cb"));
-    assert_eq!(plan.replaced, 0);
-    assert_eq!(plan.skipped, BTreeMap::from([(Skip::MissingGlyphs, 1)]));
-    assert!(plan.edit.is_none());
+    assert_eq!((plan.replaced, plan.skipped_total()), (1, 0));
+    assert!(plan.edit.is_some());
 }
 
-/// A character Helvetica has no code for is never written as a box or a `?`: whether another font
-/// has it or none does, the match is left alone and reported.
+/// A character no font of this build has is never written as a box or a `?`: the match is left
+/// alone and reported. Han goes in when the build has a Japanese face to draw it.
 #[test]
 fn a_replacement_outside_the_fonts_encoding_is_reported_and_changes_nothing() {
-    for with in ["\u{65E5}\u{672C}", "\u{1F600}"] {
+    let japanese = !pdfcraft_fonts::document_japanese_fonts_for_style(false, false).is_empty();
+    for (with, drawn) in [("\u{65E5}\u{672C}", japanese), ("\u{1F600}", false)] {
         let (mut s, id) = open(pdf("BT /F1 12 Tf 72 700 Td (one cat) Tj ET"));
         let plan = replace_all(&mut s, id, &query("cat", with));
+        if drawn {
+            assert_eq!((plan.replaced, plan.skipped_total()), (1, 0), "{with}: {plan:?}");
+            assert_eq!(texts(&s, id, 0), [format!("one {with}")]);
+            continue;
+        }
         assert_eq!((plan.replaced, plan.skipped_total()), (0, 1), "{with}: {plan:?}");
         assert!(plan.edit.is_none(), "{with}");
         assert_eq!(texts(&s, id, 0), ["one cat"]);
