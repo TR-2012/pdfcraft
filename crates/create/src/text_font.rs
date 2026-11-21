@@ -9,9 +9,25 @@ use pdfcraft_fonts::{helvetica_width, literal, win_ansi};
 
 use crate::CreateError;
 
-/// The bundled face, Regular.
-fn face() -> Option<&'static pdfcraft_fonts::CraftFont> {
-    pdfcraft_fonts::document_latin_fonts(false).into_iter().next()
+/// The faces text Helvetica can't draw may be set in, in order: the bundled Inter face, then the
+/// Korean and Japanese craft-fonts faces (Regular first).
+fn faces() -> Vec<&'static pdfcraft_fonts::CraftFont> {
+    pdfcraft_fonts::document_latin_fonts(false)
+        .into_iter()
+        .chain(pdfcraft_fonts::document_korean_fonts_for_style(false, false))
+        .chain(pdfcraft_fonts::document_japanese_fonts_for_style(false, false))
+        .collect()
+}
+
+/// The first of [`faces`] that draws every line of `text`, else the first face (which then
+/// reports what it lacks).
+fn face_for(text: &str) -> Option<&'static pdfcraft_fonts::CraftFont> {
+    let all = faces();
+    let drawn: Vec<String> = text.split('\n').map(|line| line.chars().filter(|c| !layout(*c)).map(drawn_as).collect()).collect();
+    all.iter()
+        .copied()
+        .find(|f| drawn.iter().all(|l| !l.chars().any(char::is_control) && pdfcraft_fonts::embedding::covers(f.bytes, l)))
+        .or_else(|| all.first().copied())
 }
 
 /// Line breaks, tabs and form feeds lay the text out; they are not drawn.
@@ -28,7 +44,7 @@ pub(crate) fn drawn_as(c: char) -> char {
 /// The line (1-based, lines split at `\n`) and character of the first one the bundled face can't
 /// draw, or `None` when it draws all of `text`.
 pub(crate) fn first_missing(text: &str) -> Option<(usize, char)> {
-    let face = face();
+    let face = face_for(text);
     let draws = |s: &str| !s.chars().any(char::is_control) && face.is_some_and(|f| pdfcraft_fonts::embedding::covers(f.bytes, s));
     let mut buf = [0u8; 4];
     text.split('\n').enumerate().find_map(|(i, line)| {
@@ -44,7 +60,7 @@ pub(crate) fn first_missing(text: &str) -> Option<(usize, char)> {
 /// The refusal for text with `c` on `line`, which neither Helvetica nor the bundled face can draw.
 pub(crate) fn undrawable_message(line: usize, c: char) -> String {
     format!(
-        "neither Helvetica nor the bundled Inter face can draw \"{}\" (U+{:04X}) in the text (line {line}); only Latin, Greek and Cyrillic letters can be written there for now",
+        "neither Helvetica nor PdfCraft's bundled faces (Inter, and the Korean and Japanese faces of this build) can draw \"{}\" (U+{:04X}) in the text (line {line})",
         c.escape_debug(),
         u32::from(c)
     )
@@ -68,9 +84,9 @@ impl TextFont {
         Self { font: doc.add(font), inter: None }
     }
 
-    /// The bundled face, embedded in `doc` once for every page.
-    pub(crate) fn inter(doc: &mut Document) -> Result<Self, CreateError> {
-        let face = face().ok_or_else(|| CreateError::Invalid("this build has no bundled Latin, Greek and Cyrillic face".into()))?;
+    /// The bundled face that draws `text` ([`face_for`]), embedded in `doc` once for every page.
+    pub(crate) fn inter(doc: &mut Document, text: &str) -> Result<Self, CreateError> {
+        let face = face_for(text).ok_or_else(|| CreateError::Invalid("this build has no bundled Latin, Greek and Cyrillic face".into()))?;
         let mut fonts = Dict::new();
         let name = pdfcraft_fonts::embedding::embed(doc, &mut fonts, face.bytes, face.family).map_err(CreateError::Invalid)?;
         let font = fonts.reference(name.as_bytes()).ok_or_else(|| CreateError::Invalid("the bundled face could not be added".into()))?;

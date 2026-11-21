@@ -5090,24 +5090,10 @@ fn the_format_panel_toggles_superscript_and_subscript_on_selection() {
     ed.focus = true;
     h.run_steps(1);
 
-    // The page's font has no "¹": with Keep fonts on (the default), Superscript is refused and
-    // the paragraph keeps its text and font.
+    // Click Superscript: "1" becomes "¹"
     h.get_by_label("FORMAT TEXT");
-    h.get_by_label("Superscript").click();
-    h.run_steps(4);
-    let s = h.state();
-    let doc = s.session.get(s.views[0].id).unwrap();
-    assert_eq!(doc.can_undo(), None, "Keep fonts refuses a superscript the font can't show");
-    assert_eq!(doc.text_blocks(0)[0].text, "Page 1");
-
-    // Unticked, the superscript is set in a stand-in face. Click Superscript: "1" becomes "¹"
-    let ed = h.state_mut().views[0].line_editor.as_mut().unwrap();
-    ed.text = "Page 1".into();
-    ed.selection = Some(5..6);
-    ed.keep_fonts = false;
-    ed.focus = true;
-    h.run_steps(1);
-    h.get_by_label("Superscript").click();
+    let btn = h.get_by_label("Superscript");
+    btn.click();
     h.run_steps(4);
 
     let s = h.state();
@@ -7823,11 +7809,12 @@ fn a_click_on_a_picture_grip_changes_nothing() {
     assert!(h.state().views[0].image_selection.is_some(), "the picture stays selected");
 }
 
-/// With Add text holding text that can't be drawn, a drag from a paragraph moves nothing: the draft
-/// stays where it is being typed (#125), as a click there leaves it.
+/// With Add text holding text that can't be drawn (an emoji, which no document face has), a drag
+/// from a paragraph moves nothing: the draft stays where it is being typed (#125), as a click
+/// there leaves it.
 #[test]
 fn add_text_moves_no_paragraph_while_it_holds_a_draft_it_cant_draw() {
-    if crate::support::skip_without_glyphs("add_text_moves_no_paragraph_while_it_holds_a_draft_it_cant_draw", "en", "Hello 世界") {
+    if crate::support::skip_without_glyphs("add_text_moves_no_paragraph_while_it_holds_a_draft_it_cant_draw", "en", "Hello 😀") {
         return;
     }
     let mut h = edit_page(pdfcraft_ui_egui::QuickTool::AddText);
@@ -7837,9 +7824,9 @@ fn add_text_moves_no_paragraph_while_it_holds_a_draft_it_cant_draw() {
     let block = h.state().session.get(id).unwrap().text_blocks(0)[0].clone();
     let blank = point_on(&h, block.rect[0], block.rect[3] + 12.0);
     slipping_click(&mut h, blank, blank);
-    h.event(egui::Event::Text("Hello 世界".into()));
+    h.event(egui::Event::Text("Hello 😀".into()));
     h.run_steps(2);
-    assert_eq!(h.state().views[0].content.draft.as_ref().map(|d| d.text.as_str()), Some("Hello 世界"), "the draft holds the text");
+    assert_eq!(h.state().views[0].content.draft.as_ref().map(|d| d.text.as_str()), Some("Hello 😀"), "the draft holds the text");
     let rect = h.state().views[0].content.draft.as_ref().map(|d| d.rect).unwrap();
     let on_text = point_on(&h, (block.rect[0] + block.rect[2]) / 2.0, (block.rect[1] + block.rect[3]) / 2.0);
     h.hover_at(on_text);
@@ -7854,7 +7841,7 @@ fn add_text_moves_no_paragraph_while_it_holds_a_draft_it_cant_draw() {
     h.run_steps(3);
     assert_eq!(h.state().session.get(id).unwrap().text_blocks(0)[0].rect, block.rect, "the paragraph stays");
     let draft = h.state().views[0].content.draft.as_ref().map(|d| (d.text.clone(), d.rect));
-    assert_eq!(draft, Some(("Hello 世界".to_string(), rect)), "and the draft stays where it is typed");
+    assert_eq!(draft, Some(("Hello 😀".to_string(), rect)), "and the draft stays where it is typed");
 }
 
 /// With Edit text, a right-click on a comment over a picture opens the comment's menu, and the

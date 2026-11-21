@@ -962,7 +962,7 @@ fn set_text(title: &str, text: &str, page: (f64, f64), font_size: f64, inter: bo
     let line_h = size * 1.25;
     let width = (w - 2.0 * margin).max(36.0);
     let mut doc = Document::new_empty();
-    let font = if inter { TextFont::inter(&mut doc)? } else { TextFont::helvetica(&mut doc) };
+    let font = if inter { TextFont::inter(&mut doc, text)? } else { TextFont::helvetica(&mut doc) };
     let lines: Vec<String> = text
         .replace("\r\n", "\n")
         .replace('\t', "    ")

@@ -292,6 +292,9 @@ pub(crate) struct EditCtx {
     /// What [`Edit::PrepareText`] prepared, repaired and left grouped, for
     /// [`Session::prepare_text`](crate::Session::prepare_text).
     pub(crate) prepared: Option<pdfcraft_edit::text::forms::Preparation>,
+    /// The stand-in face a text edit set some of its text in, because the text's own font lacks
+    /// those characters: said after the edit ([`crate::EditNotice::FontSubstituted`]), not silent.
+    pub(crate) substituted_font: Option<String>,
 }
 
 impl EditCtx {
@@ -345,6 +348,7 @@ impl EditCtx {
             redaction_elsewhere: None,
             redaction_identification: pdfcraft_redact::Identification::default(),
             prepared: None,
+            substituted_font: None,
         }
     }
 
@@ -910,7 +914,7 @@ pub(crate) fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut E
             a11y::move_tag(doc, *object, *anchor, *placement).map_err(|e| EditError::Accessibility(e.to_string()))?;
         }
         Edit::EditTextLine { page, line, text } => {
-            pdfcraft_edit::replace_line(doc, *page, *line, text)?;
+            cx.substituted_font = pdfcraft_edit::replace_line(doc, *page, *line, text)?.substituted;
         }
         Edit::SetFieldScript { name, event, script } => {
             pdfcraft_forms::set_field_script(doc, name, event, script.as_deref())?;
@@ -938,12 +942,13 @@ pub(crate) fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut E
         Edit::EditTextBlock { page, block, text, style } => {
             let edit = pdfcraft_edit::rewrite_block(doc, *page, *block, Some(text), style)?;
             // `doc` is the edit's working copy: refusing here leaves the document unchanged.
-            if let Some(face) = edit.substituted.filter(|_| style.keep_fonts) {
+            if let Some(face) = edit.substituted.as_deref().filter(|_| style.keep_fonts) {
                 return Err(EditError::Invalid(format!(
                     "the paragraph's font can't show all of this text, so part of it would be set in {face}; \
                      Keep fonts is on, so nothing was changed (choose a font that has these characters, or turn Keep fonts off)"
                 )));
             }
+            cx.substituted_font = edit.substituted;
         }
         Edit::PrepareText { page } => {
             let result = pdfcraft_edit::text::forms::prepare(doc, *page)?;

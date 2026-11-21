@@ -1,4 +1,5 @@
-//! Arabic, Hebrew and Thai text shaping with the matching craft-fonts face and bounded glyph outlines.
+//! Arabic, Hebrew, Thai, Korean and Japanese text shaping with the matching craft-fonts face and
+//! bounded glyph outlines.
 
 use std::sync::OnceLock;
 
@@ -32,6 +33,11 @@ pub enum ShapedScript {
     /// ([`crate::document_latin_fonts`]), which every build has: for the ones WinAnsiEncoding
     /// lacks, beside the standard font that draws the rest.
     Latin,
+    /// Hangul (and whatever else the Korean face has that the standard fonts lack) in the first
+    /// Korean craft-fonts face.
+    Korean,
+    /// Kana, Han and full-width forms in the Japanese document face.
+    Japanese,
 }
 
 impl ShapedScript {
@@ -41,6 +47,8 @@ impl ShapedScript {
             Self::Hebrew => crate::document_hebrew_font(false),
             Self::Thai => crate::document_thai_font(),
             Self::Latin => crate::document_latin_fonts(false).into_iter().next(),
+            Self::Korean => crate::document_korean_fonts_for_style(false, false).into_iter().next(),
+            Self::Japanese => crate::document_japanese_font_for_style(false, false),
         }
     }
 }
@@ -50,11 +58,15 @@ fn face(script: ShapedScript) -> Option<&'static (FontRef<'static>, ShaperData)>
     static HEBREW: OnceLock<Option<(FontRef<'static>, ShaperData)>> = OnceLock::new();
     static THAI: OnceLock<Option<(FontRef<'static>, ShaperData)>> = OnceLock::new();
     static LATIN: OnceLock<Option<(FontRef<'static>, ShaperData)>> = OnceLock::new();
+    static KOREAN: OnceLock<Option<(FontRef<'static>, ShaperData)>> = OnceLock::new();
+    static JAPANESE: OnceLock<Option<(FontRef<'static>, ShaperData)>> = OnceLock::new();
     let cache = match script {
         ShapedScript::Arabic => &FACE,
         ShapedScript::Hebrew => &HEBREW,
         ShapedScript::Thai => &THAI,
         ShapedScript::Latin => &LATIN,
+        ShapedScript::Korean => &KOREAN,
+        ShapedScript::Japanese => &JAPANESE,
     };
     cache
         .get_or_init(|| {
@@ -110,6 +122,56 @@ pub fn shape_latin(text: &str) -> Result<Vec<ShapedCluster>, GlyphError> {
     shape_script(text, false, ShapedScript::Latin)
 }
 
+/// Whether the Korean document face has a glyph for `c` (false without the face).
+pub fn korean_has(c: char) -> bool {
+    face(ShapedScript::Korean).is_some_and(|(font, _)| font.charmap().map(c).is_some_and(|g| g.to_u32() != 0))
+}
+
+/// Whether the Japanese document face has a glyph for `c` (false without the face).
+pub fn japanese_has(c: char) -> bool {
+    face(ShapedScript::Japanese).is_some_and(|(font, _)| font.charmap().map(c).is_some_and(|g| g.to_u32() != 0))
+}
+
+/// Hangul: the jamo, compatibility jamo, extended jamo and the precomposed syllables.
+pub fn is_hangul(c: char) -> bool {
+    matches!(u32::from(c), 0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xAC00..=0xD7AF | 0xD7B0..=0xD7FF)
+}
+
+/// Kana, CJK ideographs, CJK punctuation and the full-width forms.
+pub fn is_cjk(c: char) -> bool {
+    matches!(u32::from(c), 0x3000..=0x30FF | 0x31F0..=0x31FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF)
+}
+
+/// The face that draws `c` when the standard fonts (WinAnsiEncoding) and the bundled Inter face
+/// can't: the Korean face for Hangul, the Japanese face (else the Korean one) for kana and Han,
+/// and for anything else (circled numbers, arrows, shapes) whichever of the two has it. `None`
+/// when neither has it, or when the standard fonts or Inter already draw it.
+pub fn cjk_fallback(c: char) -> Option<ShapedScript> {
+    if matches!(c, '\n' | '\r' | '\t') || crate::win_ansi_encodable(c) || latin_has(c) || crate::shaped_text::is_thai(c) {
+        return None;
+    }
+    let korean = || korean_has(c).then_some(ShapedScript::Korean);
+    let japanese = || japanese_has(c).then_some(ShapedScript::Japanese);
+    if is_hangul(c) {
+        korean()
+    } else if is_cjk(c) {
+        japanese().or_else(korean)
+    } else {
+        korean().or_else(japanese)
+    }
+}
+
+/// Shape a run of Korean text (Hangul, and what [`cjk_fallback`] gives the Korean face) with the
+/// Korean document face. [`GlyphError::NoFont`] without the face.
+pub fn shape_korean(text: &str) -> Result<Vec<ShapedCluster>, GlyphError> {
+    shape_script(text, false, ShapedScript::Korean)
+}
+
+/// Shape a run of kana and Han with the Japanese document face.
+pub fn shape_japanese(text: &str) -> Result<Vec<ShapedCluster>, GlyphError> {
+    shape_script(text, false, ShapedScript::Japanese)
+}
+
 /// The scripts the bundled face's runs are shaped as.
 #[derive(Clone, Copy, PartialEq)]
 enum LatinRun {
@@ -146,11 +208,15 @@ fn shape_script(text: &str, rtl: bool, kind: ShapedScript) -> Result<Vec<ShapedC
             LatinRun::Cyrillic => script::CYRILLIC,
             LatinRun::Latin => script::LATIN,
         },
+        ShapedScript::Korean => script::HANGUL,
+        ShapedScript::Japanese => script::HAN,
     });
     // Preserve the historical Arabic per-character mapping; Hebrew, Thai and Latin marks stay with their base.
     buffer.set_cluster_level(match kind {
         ShapedScript::Arabic => BufferClusterLevel::Characters,
-        ShapedScript::Hebrew | ShapedScript::Thai | ShapedScript::Latin => BufferClusterLevel::MonotoneGraphemes,
+        ShapedScript::Hebrew | ShapedScript::Thai | ShapedScript::Latin | ShapedScript::Korean | ShapedScript::Japanese => {
+            BufferClusterLevel::MonotoneGraphemes
+        }
     });
     let shaped = shaper.shape(buffer, ShapeOptions::new());
     // Clusters are byte offsets into `text`; a cluster shows the characters up to the next one.

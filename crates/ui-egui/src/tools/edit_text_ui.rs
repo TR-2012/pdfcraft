@@ -104,8 +104,9 @@ pub struct LineEditor {
     extras0: Extras,
     /// The text the box's own Undo history starts from; see [`forget_typing_before`].
     typing_from: Option<String>,
-    /// Format text ▸ Keep fonts: refuse an edit that would substitute a font. On by default, so
-    /// a paragraph never changes font without someone choosing it.
+    /// Format text ▸ Keep fonts: refuse an edit that would substitute a font. Off by default: a
+    /// character the paragraph's font lacks is set in a stand-in face, and the app says which
+    /// (`EditNotice::FontSubstituted`), so a font never changes silently either way.
     pub keep_fonts: bool,
 }
 
@@ -807,7 +808,7 @@ fn open_editor(cx: PageToolContext<'_>, lines: &[pdfcraft_engine::TextBlock], bo
         extras: Extras::default(),
         extras0: Extras::default(),
         typing_from: None,
-        keep_fonts: true,
+        keep_fonts: false,
     });
 }
 

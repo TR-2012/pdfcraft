@@ -155,11 +155,15 @@ fn text_keeps_leading_spaces_and_tabs() {
 /// PdfCraft generates writes such characters as [U+XXXX] and says so.
 #[test]
 fn text_helvetica_cannot_draw_is_refused_or_escaped() {
-    let err = from_text("notes", "Café —\tok\r\n\u{c}第二页 notes", LETTER, 11.0).unwrap_err();
+    // Ethiopic: neither Helvetica nor a bundled face has it.
+    let err = from_text("notes", "Café —\tok\r\n\u{c}ሰላም notes", LETTER, 11.0).unwrap_err();
     let CreateError::Invalid(msg) = &err else { panic!("{err:?}") };
-    assert!(msg.contains("(line 2)") && msg.contains("\"第\" (U+7B2C)") && msg.contains("Cyrillic letters"), "{msg}");
+    assert!(msg.contains("(line 2)") && msg.contains("\"ሰ\" (U+1230)") && msg.contains("bundled faces"), "{msg}");
     // Western European text, tabs, CRLF and form feeds included, still converts.
     from_text("notes", "Café —\tok\r\n\u{c}Seite zwei: Grüße", LETTER, 11.0).unwrap();
+    // Korean converts in the Korean face where the build has one, and is refused where it hasn't.
+    let korean = from_text("notes", "제안서 시험\nPage 2", LETTER, 11.0);
+    assert_eq!(korean.is_ok(), pdfcraft_fonts::korean_has('제'), "{:?}", korean.err());
     let (doc, escaped) = from_text_escaped("Summary of Comments on 报告.pdf", "Comment: 签名 ok\nPage 2", LETTER, 11.0).unwrap();
     assert_eq!(escaped, 2);
     let doc = reopen(&doc);
