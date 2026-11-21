@@ -1,6 +1,8 @@
 //! The Tesseract engine: an installed `tesseract` binary driven as an optional external
 //! process (`tesseract <png> stdout -l <lang> tsv`), never linked, never bundled, never
-//! downloaded. The whole module is compiled out for wasm32, where nothing may spawn.
+//! downloaded. A `tessdata` folder of language data beside the executable is used for a
+//! language the install lacks. The whole module is compiled out for wasm32, where nothing may
+//! spawn.
 //!
 //! Security posture (hard rules): the program path comes from the PATH or a user-configured
 //! location, never from document data; the language code is allow-listed before it reaches a
@@ -106,6 +108,35 @@ fn path_search_in(dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Where the Windows installers put `tesseract.exe` when they leave it off the PATH (the UB
+/// Mannheim build's default): `%ProgramFiles%\Tesseract-OCR`, or the per-user
+/// `%LOCALAPPDATA%\Programs\Tesseract-OCR`. Fixed locations from the environment, never from
+/// document data. `None` elsewhere.
+fn installed_location() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let roots = [std::env::var_os("ProgramFiles").map(PathBuf::from), std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Programs"))];
+    roots.into_iter().flatten().map(|root| root.join("Tesseract-OCR").join("tesseract.exe")).find(|p| program_is_executable(p))
+}
+
+/// The `tessdata` folder beside PdfCraft's executable, when it holds `lang`'s data and the user
+/// hasn't set `TESSDATA_PREFIX`: a portable copy's own language data (Korean, for instance),
+/// which a fresh Tesseract install lacks. Used for that recognition run only, so `--list-langs`
+/// still reports the install's own languages.
+fn bundled_tessdata(lang: &str) -> Option<PathBuf> {
+    if std::env::var_os("TESSDATA_PREFIX").is_some() {
+        return None;
+    }
+    tessdata_with(&std::env::current_exe().ok()?.parent()?.join("tessdata"), lang)
+}
+
+/// `dir` when it holds `<lang>.traineddata`. `lang` is an allow-listed code ([`language_code`]),
+/// never document data.
+fn tessdata_with(dir: &Path, lang: &str) -> Option<PathBuf> {
+    dir.join(format!("{lang}.traineddata")).is_file().then(|| dir.to_path_buf())
 }
 
 /// The file names an installed `tesseract` binary goes by.
@@ -299,7 +330,7 @@ impl TesseractCli {
     /// A `PDFCRAFT_TESSERACT` that is set but invalid fails closed: it is never replaced by
     /// the PATH search.
     pub fn find() -> Option<TesseractCli> {
-        TesseractCli::at(locate(std::env::var_os("PDFCRAFT_TESSERACT"), path_search)?)
+        TesseractCli::at(locate(std::env::var_os("PDFCRAFT_TESSERACT"), || path_search().or_else(installed_location))?)
     }
 
     /// Run `tesseract --list-langs` and parse it; also decides [`TesseractCli::available`].
@@ -328,14 +359,19 @@ impl TesseractCli {
 
     /// Run the program with fixed argv, its stdout in a private temp file, under `timeout`
     /// seconds and an output cap of `max_output` bytes. Returns the (capped) stdout.
-    fn run(&self, args: &[&str], timeout: Duration, max_output: u64) -> Result<String, OcrError> {
-        self.run_capture(args, timeout, max_output).map(|(out, _)| out)
+    fn run(&self, args: &[&str], tessdata: Option<&Path>, timeout: Duration, max_output: u64) -> Result<String, OcrError> {
+        self.run_capture_in(args, tessdata, timeout, max_output).map(|(out, _)| out)
     }
 
     /// [`Self::run`], also returning what the program wrote to stderr (up to
     /// [`MAX_STDERR`] bytes, its end kept): some Tesseract versions print the `--list-langs`
     /// list there instead of on stdout.
     fn run_capture(&self, args: &[&str], timeout: Duration, max_output: u64) -> Result<(String, String), OcrError> {
+        self.run_capture_in(args, None, timeout, max_output)
+    }
+
+    /// [`Self::run_capture`] with `TESSDATA_PREFIX` set to `tessdata` when there is one.
+    fn run_capture_in(&self, args: &[&str], tessdata: Option<&Path>, timeout: Duration, max_output: u64) -> Result<(String, String), OcrError> {
         let dir = TempDir::create()?;
         let out_path = dir.path.join("out.txt");
         let err_path = dir.path.join("err.txt");
@@ -372,6 +408,7 @@ impl TesseractCli {
                 }))
                 .env("TMP", &dir.path)
                 .env("TEMP", &dir.path)
+                .envs(tessdata.map(|d| ("TESSDATA_PREFIX", d)))
                 .spawn()
                 .map_err(|e| OcrError::NoTesseract(format!("{} could not start: {e}", self.program.display())))?;
         let started = Instant::now();
@@ -485,7 +522,8 @@ impl Recognizer for TesseractCli {
             f.write_all(&png).map_err(|e| OcrError::Process(format!("writing the image failed: {e}")))?;
         }
         // Fixed argv, no shell: tesseract <png> stdout -l <lang> tsv.
-        let tsv = self.run(&[&png_path.to_string_lossy(), "stdout", "-l", lang, "tsv"], self.timeout, self.max_output)?;
+        let tessdata = bundled_tessdata(lang);
+        let tsv = self.run(&[&png_path.to_string_lossy(), "stdout", "-l", lang, "tsv"], tessdata.as_deref(), self.timeout, self.max_output)?;
         let (lines, truncated) = parse_tsv_bounded(&tsv);
         if truncated {
             return Err(OcrError::Recognize(format!("the {MAX_WORDS}-word limit was exceeded; the incomplete reading was rejected")));
@@ -696,6 +734,16 @@ mod tests {
     }
 
     #[test]
+    fn bundled_language_data_is_used_only_when_it_has_the_language() {
+        let dir = TempDir::create().unwrap();
+        assert_eq!(tessdata_with(&dir.path, "kor"), None, "an empty folder is not used");
+        std::fs::write(dir.path.join("kor.traineddata"), b"data").unwrap();
+        assert_eq!(tessdata_with(&dir.path, "kor"), Some(dir.path.clone()));
+        assert_eq!(tessdata_with(&dir.path, "jpn"), None, "the install's own data reads the rest");
+        assert_eq!(tessdata_with(&dir.path.join("missing"), "kor"), None);
+    }
+
+    #[test]
     fn list_langs_come_from_stderr_when_stdout_has_none() {
         let listing = "List of available languages in \"/usr/share/tessdata/\" (2):\neng\nosd\n";
         assert_eq!(list_langs_from(listing, ""), ["eng", "osd"]);
@@ -894,7 +942,7 @@ mod tests {
         let png = encode_png(&blot(8, 8, 0, 0, 4, 4)).unwrap();
         std::fs::write(dir.join("page.png"), png).unwrap();
         let png_arg = dir.join("page.png").to_string_lossy().into_owned();
-        let tsv = t.run(&[png_arg.as_str(), "stdout", "-l", "eng", "tsv"], t.timeout, t.max_output).unwrap();
+        let tsv = t.run(&[png_arg.as_str(), "stdout", "-l", "eng", "tsv"], None, t.timeout, t.max_output).unwrap();
         for (why, name) in [("the child's temp dir", "TMP="), ("temp", "TEMP="), ("lookup path", "PATH=")] {
             assert!(tsv.contains(name), "{why} must be passed: {tsv}");
         }
@@ -918,7 +966,7 @@ $n = [PdfCraftOcrProbe.Console]::GetConsoleProcessList($ids, 256)
 "$([PdfCraftOcrProbe.Console]::GetConsoleWindow()) $($ids[0..($n-1)] -join ',')""#;
         let root = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
         let t = TesseractCli::new(root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
-        let text = t.run(&["-NoProfile", "-NonInteractive", "-Command", PROBE], t.timeout, t.max_output).unwrap();
+        let text = t.run(&["-NoProfile", "-NonInteractive", "-Command", PROBE], None, t.timeout, t.max_output).unwrap();
         let (window, attached) = text.trim().split_once(' ').unwrap();
         assert_eq!(window, "0", "the program has a console window: {text}");
         let attached: Vec<u32> = attached.split(',').map(|id| id.parse().unwrap()).collect();

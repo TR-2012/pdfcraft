@@ -8,8 +8,18 @@ pub struct FontFile {
     pub face: String,
 }
 
-/// Standard user-installed font folders; discovery is performed only on request.
+/// Standard user-installed font folders, and the `fonts` folder beside the executable (a
+/// portable copy's own fonts); discovery is performed only on request.
 pub fn installed_directories() -> Vec<PathBuf> {
+    let mut dirs = system_directories();
+    // Last, so the scan (which takes roots from the end) lists the app's own folder first.
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("fonts"))).filter(|d| d.is_dir()) {
+        dirs.push(dir);
+    }
+    dirs
+}
+
+fn system_directories() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if cfg!(target_os = "macos") {
         let mut dirs = vec![PathBuf::from("/Library/Fonts")];
@@ -36,7 +46,8 @@ pub fn installed_directories() -> Vec<PathBuf> {
 /// Only standalone, openly licensed, embeddable faces are listed.
 /// The caller controls roots (automation resolves confinement before calling this).
 pub fn discover(roots: &[PathBuf]) -> Vec<FontFile> {
-    discover_budgeted(roots, 64u64 << 20)
+    // Room for a full `fonts` folder beside the executable as well as the system's own.
+    discover_budgeted(roots, 256u64 << 20)
 }
 
 /// Bounded scan with resolved roots and no descendant symlinks. `budget` caps the total
