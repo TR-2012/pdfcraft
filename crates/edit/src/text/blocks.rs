@@ -548,6 +548,11 @@ pub struct BlockStyle {
     /// How far across [`BlockStyle::cover`] may reach, whatever its padding: the edges of the words
     /// on either side that stay (user space).
     pub cover_between: Option<[f64; 2]>,
+    /// Refuse the edit instead of setting any of the text in a font nobody chose. Without it, text
+    /// the paragraph's font can't show takes a standard or fallback face, and the edit only reports
+    /// it in [`crate::LineEdit::substituted`]. The engine checks it after the rewrite, on its
+    /// working copy, so a refused edit leaves the document as it was.
+    pub keep_fonts: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

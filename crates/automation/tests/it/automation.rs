@@ -4764,6 +4764,57 @@ fn mixed_script_paragraph_keeps_source_fonts_through_tools_and_reopen() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Keep fonts refuses a paragraph edit that would set any text in a stand-in face, and changes
+/// nothing; without it the same edit goes ahead in Helvetica, and text the font can show keeps it.
+#[test]
+fn keep_fonts_refuses_a_paragraph_edit_that_would_substitute_a_font() {
+    let dir = workdir("keep-fonts");
+    // A subset Arial with widths (and so glyphs) for a and b only.
+    let content = "BT /F1 12 Tf 72 700 Td (ab) Tj ET";
+    let objs = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_string(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        "<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+Arial /FirstChar 97 /LastChar 99 /Widths [500 520 0] /Encoding /WinAnsiEncoding >>"
+            .to_string(),
+    ];
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        pdf.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    std::fs::write(dir.join("subset.pdf"), pdf).unwrap();
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_open", json!({"path":"subset.pdf"}))["doc"].as_u64().unwrap();
+    let font = |a: &mut Automation| ok(a, "text_lines", json!({"doc":doc,"page":1}))["lines"][0]["font"].as_str().unwrap().to_owned();
+
+    let refused = a.call("text_edit", &json!({"doc":doc,"page":1,"paragraph":1,"text":"xyz","keep_fonts":true}));
+    let message = format!("{refused:?}");
+    assert!(refused.is_err() && message.contains("Keep fonts") && message.contains("Helvetica"), "{message}");
+    assert_eq!(page_text(&mut a, doc), ["ab"], "a refused edit changes nothing");
+    assert!(font(&mut a).ends_with("Arial"));
+    assert_eq!(ok(&mut a, "doc_list", json!({}))["documents"][0]["dirty"], json!(false), "nothing unsaved after a refusal");
+
+    // Text the source font can show is still edited with Keep fonts on, in that font.
+    ok(&mut a, "text_edit", json!({"doc":doc,"page":1,"paragraph":1,"text":"ba","keep_fonts":true}));
+    assert_eq!(page_text(&mut a, doc), ["ba"]);
+    assert!(font(&mut a).ends_with("Arial"));
+
+    // Without Keep fonts the same edit goes ahead in a stand-in.
+    ok(&mut a, "text_edit", json!({"doc":doc,"page":1,"paragraph":1,"text":"xyz"}));
+    assert_eq!(page_text(&mut a, doc), ["xyz"]);
+    assert_eq!(font(&mut a), "Helvetica");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn paragraph_bold_without_font_keeps_the_source_family() {
     let dir = workdir("paragraph-bold");

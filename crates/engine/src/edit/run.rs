@@ -936,7 +936,14 @@ pub(crate) fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut E
         Edit::DeleteObjects { page, objects } => crate::object_clip::delete(doc, *page, objects, |doc, edit| run_edit(doc, edit, cx))?,
         Edit::PasteObjects { page, clip, offset } => crate::object_clip::paste(doc, *page, clip, *offset)?,
         Edit::EditTextBlock { page, block, text, style } => {
-            pdfcraft_edit::rewrite_block(doc, *page, *block, Some(text), style)?;
+            let edit = pdfcraft_edit::rewrite_block(doc, *page, *block, Some(text), style)?;
+            // `doc` is the edit's working copy: refusing here leaves the document unchanged.
+            if let Some(face) = edit.substituted.filter(|_| style.keep_fonts) {
+                return Err(EditError::Invalid(format!(
+                    "the paragraph's font can't show all of this text, so part of it would be set in {face}; \
+                     Keep fonts is on, so nothing was changed (choose a font that has these characters, or turn Keep fonts off)"
+                )));
+            }
         }
         Edit::PrepareText { page } => {
             let result = pdfcraft_edit::text::forms::prepare(doc, *page)?;
