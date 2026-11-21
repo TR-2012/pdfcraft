@@ -5090,10 +5090,24 @@ fn the_format_panel_toggles_superscript_and_subscript_on_selection() {
     ed.focus = true;
     h.run_steps(1);
 
-    // Click Superscript: "1" becomes "¹"
+    // The page's font has no "¹": with Keep fonts on (the default), Superscript is refused and
+    // the paragraph keeps its text and font.
     h.get_by_label("FORMAT TEXT");
-    let btn = h.get_by_label("Superscript");
-    btn.click();
+    h.get_by_label("Superscript").click();
+    h.run_steps(4);
+    let s = h.state();
+    let doc = s.session.get(s.views[0].id).unwrap();
+    assert_eq!(doc.can_undo(), None, "Keep fonts refuses a superscript the font can't show");
+    assert_eq!(doc.text_blocks(0)[0].text, "Page 1");
+
+    // Unticked, the superscript is set in a stand-in face. Click Superscript: "1" becomes "¹"
+    let ed = h.state_mut().views[0].line_editor.as_mut().unwrap();
+    ed.text = "Page 1".into();
+    ed.selection = Some(5..6);
+    ed.keep_fonts = false;
+    ed.focus = true;
+    h.run_steps(1);
+    h.get_by_label("Superscript").click();
     h.run_steps(4);
 
     let s = h.state();

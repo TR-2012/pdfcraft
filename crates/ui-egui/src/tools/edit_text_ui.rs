@@ -104,6 +104,9 @@ pub struct LineEditor {
     extras0: Extras,
     /// The text the box's own Undo history starts from; see [`forget_typing_before`].
     typing_from: Option<String>,
+    /// Format text ▸ Keep fonts: refuse an edit that would substitute a font. On by default, so
+    /// a paragraph never changes font without someone choosing it.
+    pub keep_fonts: bool,
 }
 
 /// The paragraph editor's text box: one for the tabs of a pane (they share it), and one for each pane
@@ -459,6 +462,8 @@ impl LineEditor {
                 scale: style.scale.take(),
             });
         }
+        // Set last: whether any formatting changed is read from the fields above.
+        style.keep_fonts = self.keep_fonts;
         style
     }
 
@@ -802,6 +807,7 @@ fn open_editor(cx: PageToolContext<'_>, lines: &[pdfcraft_engine::TextBlock], bo
         extras: Extras::default(),
         extras0: Extras::default(),
         typing_from: None,
+        keep_fonts: true,
     });
 }
 
@@ -981,7 +987,7 @@ pub(crate) fn page_input(cx: PageToolContext<'_>, lines: &[pdfcraft_engine::Text
             }
             if let Some(old) = view.line_editor.take() {
                 let style = old.style();
-                if old.text != old.original || style != pdfcraft_engine::BlockStyle::default() {
+                if old.text != old.original || changes_format(&style) {
                     view.applied_editor = Some(old.clone());
                     view.pending_edit = Some(Edit::EditTextBlock { page: old.page, block: old.block, text: old.text, style });
                 }
@@ -1209,15 +1215,16 @@ pub(crate) fn overlay(ctx: &egui::Context, keys: PageKeys, view: &mut DocView, i
     }
 }
 
+/// Whether `style` changes any formatting. Keep fonts is how an edit is checked, not a format, so
+/// it alone is no change.
+fn changes_format(style: &pdfcraft_engine::BlockStyle) -> bool {
+    *style != pdfcraft_engine::BlockStyle { keep_fonts: style.keep_fonts, ..Default::default() }
+}
+
 /// The edit a closed paragraph editor applies, or `None` when nothing in it changed.
 pub(crate) fn finished_edit(ed: LineEditor) -> Option<Edit> {
     let style = ed.style();
-    (ed.text != ed.original || style != pdfcraft_engine::BlockStyle::default()).then_some(Edit::EditTextBlock {
-        page: ed.page,
-        block: ed.block,
-        text: ed.text,
-        style,
-    })
+    (ed.text != ed.original || changes_format(&style)).then_some(Edit::EditTextBlock { page: ed.page, block: ed.block, text: ed.text, style })
 }
 
 /// Where the keyboard is: the centre of the widget that has it. A text box that loses it to a
@@ -1727,6 +1734,7 @@ C", &picked
             extras: Extras::default(),
             extras0: Extras::default(),
             typing_from: None,
+            keep_fonts: true,
         };
         (app, ed)
     }
@@ -1999,9 +2007,50 @@ C", &picked
             extras: Extras { line_spacing: 1.33, underline: true, ..Default::default() },
             extras0: Extras::default(),
             typing_from: None,
+            keep_fonts: true,
         };
         let style = ed.style();
         assert_eq!(style.line_spacing, Some(1.33));
         assert_eq!(style.underline, Some(true));
+    }
+
+    /// Keep fonts is on for every paragraph edit unless unticked, and on its own it is no change:
+    /// an editor closed without edits applies nothing.
+    #[test]
+    fn keep_fonts_goes_with_every_edit_and_is_no_change_alone() {
+        let mut ed = LineEditor {
+            page: 0,
+            block: 0,
+            text: "Paragraph text".to_string(),
+            original: "Paragraph text".to_string(),
+            rect: egui::Rect::ZERO,
+            source_rect: [0.0; 4],
+            max_width: 100.0,
+            overflow: false,
+            selection: None,
+            font_resource: None,
+            fonts: std::collections::BTreeMap::new(),
+            source: None,
+            multiline: false,
+            size: 12.0,
+            family_chosen: false,
+            size_chosen: false,
+            focus: true,
+            had_focus: false,
+            look: pdfcraft_engine::AddedText::default(),
+            look0: pdfcraft_engine::AddedText::default(),
+            extras: Extras::default(),
+            extras0: Extras::default(),
+            typing_from: None,
+            keep_fonts: true,
+        };
+        assert!(ed.style().keep_fonts);
+        assert!(finished_edit(ed.clone()).is_none(), "Keep fonts alone changes nothing");
+        ed.text = "Edited text".to_string();
+        let Some(Edit::EditTextBlock { style, .. }) = finished_edit(ed.clone()) else { panic!("a text change is an edit") };
+        assert!(style.keep_fonts);
+        ed.keep_fonts = false;
+        let Some(Edit::EditTextBlock { style, .. }) = finished_edit(ed) else { panic!("a text change is an edit") };
+        assert!(!style.keep_fonts, "unticked, the edit may substitute");
     }
 }
