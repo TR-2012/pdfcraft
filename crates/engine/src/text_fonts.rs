@@ -1,11 +1,18 @@
 //! Explicit document-font discovery. Interface fallbacks never enter this catalogue.
 use std::path::{Path, PathBuf};
 
+/// A font file's face as the standalone program `Edit::RegisterTextFont` takes, and the most
+/// bytes of a font file read for one: for callers that load a face of a collection.
+pub use pdfcraft_fonts::embedding::{MAX_FONT_FILE_BYTES, standalone_face};
+
 #[derive(Clone, Debug)]
 pub struct FontFile {
     pub path: PathBuf,
     pub family: String,
     pub face: String,
+    /// Which face of the file this is: 0 for a standalone font, its place in a collection
+    /// (`.ttc`, `.otc`) otherwise. `pdfcraft_fonts::embedding::standalone_face` takes it.
+    pub face_index: u32,
 }
 
 /// Standard user-installed font folders; discovery is performed only on request.
@@ -32,11 +39,23 @@ pub fn installed_directories() -> Vec<PathBuf> {
     }
 }
 
+/// The total size of the fonts one scan lists.
+const SCAN_BUDGET: u64 = 64 << 20;
+
+/// The same in a build that accepts any document font: every installed font qualifies there, and
+/// a machine's font folder holds a gigabyte or more of them.
+const ANY_FONT_SCAN_BUDGET: u64 = 4 << 30;
+
+/// Most faces listed from one collection file.
+const MAX_FACES_PER_FILE: u32 = 16;
+
 /// Bounded scan with resolved roots and no descendant symlinks.
-/// Only standalone, openly licensed, embeddable faces are listed.
+/// Only embeddable faces are listed, openly licensed ones unless the build accepts any document
+/// font; a collection lists each of its faces.
 /// The caller controls roots (automation resolves confinement before calling this).
 pub fn discover(roots: &[PathBuf]) -> Vec<FontFile> {
-    discover_budgeted(roots, 64u64 << 20)
+    let budget = if pdfcraft_fonts::embedding::accepts_any_document_font() { ANY_FONT_SCAN_BUDGET } else { SCAN_BUDGET };
+    discover_budgeted(roots, budget)
 }
 
 /// Bounded scan with resolved roots and no descendant symlinks. `budget` caps the total
@@ -70,7 +89,7 @@ pub fn discover_budgeted(roots: &[PathBuf], mut budget: u64) -> Vec<FontFile> {
                 sorted_children.sort();
                 pending.extend(sorted_children.into_iter().rev().map(|p| (p, depth + 1)));
             }
-        } else if meta.is_file() && meta.len() <= (16 << 20) && font_extension(&path) {
+        } else if meta.is_file() && meta.len() <= pdfcraft_fonts::embedding::MAX_FONT_FILE_BYTES as u64 && font_extension(&path) {
             if meta.len() > budget || meta.len() > read_allowance {
                 continue;
             }
@@ -80,20 +99,33 @@ pub fn discover_budgeted(roots: &[PathBuf], mut budget: u64) -> Vec<FontFile> {
             if read.is_err() || bytes.len() != meta.len() as usize {
                 continue;
             }
-            if pdfcraft_fonts::embedding::validate_document_input(&bytes).is_err() {
-                continue;
-            }
-            if let Ok((family, face)) = pdfcraft_fonts::embedding::names(&bytes) {
-                let key = font_content_key(&bytes);
-                if seen_face_content.insert((face.clone(), key)) {
-                    budget = budget.saturating_sub(meta.len());
-                    files.push(FontFile { path, family, face });
-                }
+            if list_faces(&path, &bytes, &mut seen_face_content, &mut files) {
+                budget = budget.saturating_sub(meta.len());
             }
         }
     }
     files.sort_by(|a, b| a.face.cmp(&b.face).then(a.path.cmp(&b.path)));
     files
+}
+
+/// Lists the document fonts in one font file: each face that passes
+/// `validate_document_input` as the standalone program it would be registered as, once per
+/// distinct content. Returns whether any face was listed.
+fn list_faces(path: &Path, file: &[u8], seen: &mut std::collections::HashSet<(String, (usize, u64))>, files: &mut Vec<FontFile>) -> bool {
+    let Ok(count) = pdfcraft_fonts::embedding::face_count(file) else { return false };
+    let mut listed = false;
+    for face_index in 0..count.min(MAX_FACES_PER_FILE) {
+        let Ok(program) = pdfcraft_fonts::embedding::standalone_face(file, face_index) else { continue };
+        if pdfcraft_fonts::embedding::validate_document_input(&program).is_err() {
+            continue;
+        }
+        let Ok((family, face)) = pdfcraft_fonts::embedding::names(&program) else { continue };
+        if seen.insert((face.clone(), font_content_key(&program))) {
+            files.push(FontFile { path: path.to_path_buf(), family, face, face_index });
+            listed = true;
+        }
+    }
+    listed
 }
 
 fn font_content_key(bytes: &[u8]) -> (usize, u64) {
@@ -103,7 +135,8 @@ fn font_content_key(bytes: &[u8]) -> (usize, u64) {
     (bytes.len(), h.finish())
 }
 fn font_extension(path: &Path) -> bool {
-    path.extension().and_then(std::ffi::OsStr::to_str).is_some_and(|e| e.eq_ignore_ascii_case("ttf") || e.eq_ignore_ascii_case("otf"))
+    const FONT_FILE_EXTENSIONS: [&str; 4] = ["ttf", "otf", "ttc", "otc"];
+    path.extension().and_then(std::ffi::OsStr::to_str).is_some_and(|e| FONT_FILE_EXTENSIONS.iter().any(|known| e.eq_ignore_ascii_case(known)))
 }
 
 #[cfg(test)]
@@ -148,6 +181,26 @@ mod tests {
         assert_eq!(found.len(), 501, "do not silently discard accepted fonts after sorting");
     }
 
+    /// A collection (`.ttc`) lists each of its faces with its place in the file; collections used
+    /// to be skipped.
+    #[test]
+    fn a_collection_lists_each_of_its_faces() {
+        let root = std::env::temp_dir().join(format!("pdfcraft-font-collection-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fonts = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts");
+        let regular = std::fs::read(fonts.join("Inter-Regular.ttf")).unwrap();
+        let medium = std::fs::read(fonts.join("Inter-Medium.ttf")).unwrap();
+        let collection = pdfcraft_fonts::embedding::collection_of(&[&regular, &medium]).unwrap();
+        std::fs::write(root.join("inter.ttc"), &collection).unwrap();
+        let found = discover(std::slice::from_ref(&root));
+        std::fs::remove_dir_all(&root).unwrap();
+        let listed: Vec<(&str, u32)> = found.iter().map(|font| (font.face.as_str(), font.face_index)).collect();
+        assert_eq!(listed, [("Inter-Medium", 1), ("Inter-Regular", 0)], "sorted by face name");
+        assert!(found.iter().all(|font| font.path.ends_with("inter.ttc")));
+        let face = standalone_face(&collection, 1).unwrap();
+        assert_eq!(pdfcraft_fonts::embedding::names(&face).unwrap().1, "Inter-Medium");
+    }
+
     #[test]
     fn test_installed_directories() {
         let dirs = installed_directories();
@@ -160,6 +213,7 @@ mod tests {
         assert!(font_extension(Path::new("Noto.otf")));
         assert!(font_extension(Path::new("CUSTOM.TTF")));
         assert!(font_extension(Path::new("ROBOTO.OTF")));
+        assert!(font_extension(Path::new("gulim.ttc")) && font_extension(Path::new("Collection.OTC")));
         assert!(!font_extension(Path::new("document.pdf")));
         assert!(!font_extension(Path::new("font.woff")));
         assert!(!font_extension(Path::new("font.woff2")));

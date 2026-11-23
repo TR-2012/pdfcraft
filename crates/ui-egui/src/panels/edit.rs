@@ -302,11 +302,13 @@ fn format_section(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens) {
                 ed.choose_family(family);
                 changed = true;
             }
-            Some(FontChoice::Load) => app.pick_files(crate::files::FilePurpose::TextFont { page: ed.page }, false),
+            Some(FontChoice::Load) => app.pick_files(crate::files::FilePurpose::TextFont { page: ed.page, face_index: 0 }, false),
             #[cfg(not(target_arch = "wasm32"))]
-            Some(FontChoice::Installed(path)) => app.use_paths(crate::files::FilePurpose::TextFont { page: ed.page }, &[path]),
+            Some(FontChoice::Installed(path, face_index)) => {
+                app.use_paths(crate::files::FilePurpose::TextFont { page: ed.page, face_index }, &[path])
+            }
             #[cfg(target_arch = "wasm32")]
-            Some(FontChoice::Installed(_)) => {}
+            Some(FontChoice::Installed(..)) => {}
             None => {}
         }
         if changed {

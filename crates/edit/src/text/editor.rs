@@ -28,11 +28,19 @@ pub(super) fn builtin_thai_choice(fonts: &Dict) -> String {
     choice
 }
 
+/// Most bytes of font programs one page lists for the editor.
+const LISTED_FONT_BYTES: usize = 32 << 20;
+
+/// The same in a build that accepts any document font: a whole CJK face is 10 to 25 MiB, and a
+/// page may hold several that the person loaded. At 32 MiB the third one was left out of the
+/// list, so it could not be chosen for a paragraph.
+const ANY_FONT_LISTED_BYTES: usize = 128 << 20;
+
 pub fn text_editor_fonts(doc: &Document, page: usize) -> Result<Vec<TextEditorFont>, EditError> {
     let p = page_dict(doc, page)?;
     let resources = p.dict.get(b"Resources").and_then(|o| doc.dict(o)).unwrap_or_default();
     let fonts = resources.get(b"Font").and_then(|o| doc.dict(o)).unwrap_or_default();
-    let mut budget = 32_usize << 20;
+    let mut budget = if pdfcraft_fonts::embedding::accepts_any_document_font() { ANY_FONT_LISTED_BYTES } else { LISTED_FONT_BYTES };
     // Every program decoded counts, usable or not, so aliases of one program can't repeat the work.
     let mut decode = DecodeBudget::new(2 * budget, 0);
     let mut result = Vec::new();
@@ -85,6 +93,10 @@ pub fn text_editor_fonts(doc: &Document, page: usize) -> Result<Vec<TextEditorFo
 /// Load an explicit full face into this page's resources. Nothing on the page is replaced;
 /// the new resource can complete matching source subsets or be chosen in a text style.
 pub fn register_text_font(doc: &mut Document, page: usize, bytes: &[u8]) -> Result<String, EditError> {
+    // A collection gives its first face and a variable font its default instance: a PDF embeds
+    // one standalone, static program. Callers that want another face pass it already extracted.
+    let program = pdfcraft_fonts::embedding::standalone_face(bytes, 0).map_err(EditError::Invalid)?;
+    let bytes: &[u8] = &program;
     pdfcraft_fonts::embedding::validate_document_input(bytes).map_err(EditError::Invalid)?;
     let (_, postscript) = pdfcraft_fonts::embedding::names(bytes).map_err(EditError::Invalid)?;
     let p = page_dict(doc, page)?;

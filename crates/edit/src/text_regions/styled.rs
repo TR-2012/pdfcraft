@@ -37,13 +37,12 @@ struct FontResolver<'a> {
 
 impl FontResolver<'_> {
     fn encodable_font(&mut self, source: &TextLine, text: &str, requested: Option<&str>) -> Result<Option<String>, EditError> {
-        if let Some(resource) = requested {
-            if !self.metrics.get(resource).is_some_and(|metrics| source_encodes(metrics, text)) {
-                return Err(EditError::Invalid(format!(
-                    "the selected font resource {resource} cannot show U+{:04X}",
-                    text.chars().next().map_or(0, u32::from)
-                )));
-            }
+        // The font chosen for the text draws what it holds. A character it lacks goes on to the
+        // paragraph's own font and the fallback faces, as a character the paragraph's font lacks
+        // does, instead of refusing the whole edit.
+        if let Some(resource) = requested
+            && self.metrics.get(resource).is_some_and(|metrics| source_encodes(metrics, text))
+        {
             return Ok(Some(resource.to_owned()));
         }
         if self.metrics.get(&source.font).is_some_and(|metrics| source_encodes(metrics, text)) {
@@ -75,6 +74,19 @@ impl FontResolver<'_> {
         }
         let family = pdfcraft_fonts::embedding::names(&bytes).map_or_else(|_| source.base_font.clone(), |(family, _)| family);
         self.embed_face(key, &bytes, &family, "the source font could not be loaded").map(Some)
+    }
+
+    /// A font already on the page that holds `text`, the first by resource name: a face the
+    /// person loaded there, or another font of the page. Only asked once no fallback face draws
+    /// the character, so that an edit is not refused while the page itself has a font for it.
+    /// The draft-only Thai names are aliases of other fonts and are passed over.
+    fn any_page_font(&self, text: &str) -> Option<String> {
+        const DRAFT_ONLY_PREFIXES: [&str; 2] = ["PCOutlineThai", "PCProgramThai"];
+        self.metrics
+            .iter()
+            .filter(|(name, _)| !DRAFT_ONLY_PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
+            .find(|(_, metrics)| source_encodes(metrics, text))
+            .map(|(name, _)| name.clone())
     }
 
     fn embed_face(&mut self, key: String, bytes: &[u8], family: &str, missing_message: &str) -> Result<String, EditError> {
@@ -273,7 +285,10 @@ impl CharacterPreparation<'_> {
                 } else if let Some(name) = resolver.encodable_font(source, &text, requested)? {
                     name
                 } else if needs_type3(&text) {
-                    fallback.prepare(source, ch, &text, chars.len())?
+                    match fallback.prepare(source, ch, &text, chars.len()) {
+                        Ok(name) => name,
+                        Err(refusal) => resolver.any_page_font(&text).ok_or(refusal)?,
+                    }
                 } else {
                     let name = resolver.substitute_font(source);
                     substituted = Some(source_family(&source.base_font).base_font(source.bold, source.italic).to_owned());
@@ -283,7 +298,8 @@ impl CharacterPreparation<'_> {
             }
         }
         drop(resolver);
-        for group in fallback.groups {
+        // A face asked only for characters it lacks drew nothing: it writes no font.
+        for group in fallback.groups.into_iter().filter(|group| !group.glyphs.is_empty()) {
             let written = write_type3_glyphs(doc, fonts, group.face, false, group.glyphs, fallback.per_font);
             for name in &written.names {
                 let font = fonts
@@ -331,7 +347,7 @@ impl FallbackBuilder {
             index
         };
         let group = self.groups.get_mut(group_index).ok_or_else(|| EditError::Invalid("the fallback face is missing".into()))?;
-        if group.seen.insert(ch) {
+        if !group.seen.contains(&ch) {
             if self.glyphs >= self.budget {
                 return Err(EditError::Invalid(format!(
                     "the replacement needs more than {} fallback glyphs; edit a smaller paragraph or load a complete font",
@@ -342,6 +358,8 @@ impl FallbackBuilder {
             let code = u8::try_from((group.glyphs.len() % self.per_font).saturating_add(1))
                 .map_err(|_| EditError::Invalid("replacement text has too many unique characters".into()))?;
             group.glyphs.push(Type3Glyph { code, ch, path, width });
+            // Only now: a character the face could not draw is not remembered as drawn.
+            group.seen.insert(ch);
             self.glyphs = self.glyphs.saturating_add(1);
         }
         group.positions.push(position);

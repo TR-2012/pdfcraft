@@ -9571,6 +9571,53 @@ fn a_new_character_comes_from_the_source_fonts_own_embedded_program() {
     }
 }
 
+/// A font chosen for a paragraph draws what it holds, and a character it lacks is drawn by a
+/// fallback face instead of refusing the whole edit ("the selected font resource … cannot show").
+#[test]
+fn a_chosen_font_that_lacks_a_character_falls_back_instead_of_refusing() {
+    let inter = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+    let resource = text::register_text_font(&mut doc, 0, inter).unwrap();
+    let style = text::BlockStyle { width: Some(400.0), resource: Some(resource), ..Default::default() };
+    // Inter has no Hangul.
+    let typed = "Name 한글";
+    let edit = text::rewrite_block(&mut doc, 0, 0, Some(typed), &style);
+    if pdfcraft_fonts::document_korean_font().is_none() {
+        eprintln!("built without a Korean craft-fonts face (CRAFT_FONTS_DIR unset): the refusal names that face");
+        let refusal = edit.unwrap_err().to_string();
+        assert!(refusal.contains("Korean fallback font") && !refusal.contains("selected font resource"), "{refusal}");
+        return;
+    }
+    edit.unwrap();
+    assert_eq!(text::text_blocks(&reopen(&doc), 0).unwrap()[0].editor_text, typed);
+}
+
+/// A character no fallback face draws is taken from a font already on the page (one the person
+/// loaded there) before the edit is refused. Without such a font the edit is still refused.
+#[test]
+fn a_character_no_fallback_face_has_is_taken_from_a_font_on_the_page() {
+    let mono = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
+    // A character JetBrains Mono has that an edit on a page without it is refused for: a Powerline
+    // arrow, a box-drawing line or a Braille pattern, whichever the fallback faces of this build
+    // leave out. Found by trying the edit, since which faces stand in depends on the build input.
+    let refused_without_a_page_font = |c: &char| {
+        let mut bare = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+        pdfcraft_fonts::embedding::covers(mono, &c.to_string())
+            && text::rewrite_block(&mut bare, 0, 0, Some(&format!("Branch {c} main")), &text::BlockStyle::default()).is_err()
+    };
+    let candidates = ('\u{E0A0}'..='\u{E0B3}').chain('\u{2500}'..='\u{259F}').chain('\u{2800}'..='\u{28FF}');
+    let Some(rare) = candidates.into_iter().find(refused_without_a_page_font) else {
+        eprintln!("skipping: the fallback faces of this build draw every candidate character");
+        return;
+    };
+    let typed = format!("Branch {rare} main");
+    let typed = typed.as_str();
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+    text::register_text_font(&mut doc, 0, mono).unwrap();
+    text::rewrite_block(&mut doc, 0, 0, Some(typed), &text::BlockStyle::default()).unwrap();
+    assert_eq!(text::text_blocks(&reopen(&doc), 0).unwrap()[0].editor_text, typed);
+}
+
 #[test]
 fn a_shaped_run_is_one_text_object_with_each_glyph_where_shaping_put_it() {
     let inter = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
