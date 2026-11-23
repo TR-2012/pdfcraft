@@ -1,4 +1,5 @@
-//! Arabic, Hebrew and Thai text shaping with the matching craft-fonts face and bounded glyph outlines.
+//! Arabic, Hebrew, Thai, Korean and Japanese text shaping with the matching craft-fonts face and
+//! bounded glyph outlines.
 
 use std::sync::OnceLock;
 
@@ -136,15 +137,14 @@ pub fn shape_latin(text: &str) -> Result<Vec<ShapedCluster>, GlyphError> {
     shape_script(text, false, ShapedScript::Latin)
 }
 
-/// Whether `c` is Hangul: conjoining jamo, compatibility jamo, the extended jamo blocks and the
-/// syllables.
-fn is_hangul(c: char) -> bool {
+/// Hangul: the jamo, compatibility jamo, extended jamo and the precomposed syllables.
+pub fn is_hangul(c: char) -> bool {
     matches!(u32::from(c), 0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xAC00..=0xD7FF)
 }
 
-/// Whether `c` is written in the shared Chinese, Japanese and Korean blocks other than Hangul:
-/// radicals, CJK symbols and punctuation, kana, Han ideographs and the full-width forms.
-fn is_kana_or_han(c: char) -> bool {
+/// The shared Chinese, Japanese and Korean blocks other than Hangul: radicals, CJK symbols and
+/// punctuation, kana, Han ideographs and the full-width forms.
+pub fn is_cjk(c: char) -> bool {
     matches!(u32::from(c), 0x2E80..=0x2FDF | 0x3000..=0x30FF | 0x31F0..=0x31FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF)
 }
 
@@ -153,20 +153,39 @@ fn script_has(script: ShapedScript, c: char) -> bool {
     face(script).is_some_and(|(font, _)| font.charmap().map(c).is_some_and(|glyph| glyph.to_u32() != 0))
 }
 
-/// The Korean or Japanese face that draws `c` in text added to a page, in the Myeongjo or Mincho
-/// kind for `serif` text. Hangul takes the Korean face. Kana, Han ideographs and CJK punctuation
-/// take the Japanese face, or the Korean one where the Japanese face lacks the character or the
-/// build has none. `None` for every other character, and when no face of the build has it.
+/// Whether the Korean (Gothic) document face has a glyph for `c` (false without the face).
+pub fn korean_has(c: char) -> bool {
+    script_has(ShapedScript::Korean { serif: false }, c)
+}
+
+/// Whether the Japanese (Gothic) document face has a glyph for `c` (false without the face).
+pub fn japanese_has(c: char) -> bool {
+    script_has(ShapedScript::Japanese { serif: false }, c)
+}
+
+/// The Korean or Japanese face that draws `c` when the standard fonts (WinAnsiEncoding) and the
+/// bundled Inter face can't, in the Myeongjo or Mincho kind for `serif` text: the Korean face for
+/// Hangul, the Japanese face (else the Korean one) for kana and Han, and for anything else
+/// (circled numbers, arrows, shapes) whichever of the two has it. `None` when neither has it, or
+/// when the standard fonts, Inter or the Thai face already draw it.
 pub fn cjk_script(c: char, serif: bool) -> Option<ShapedScript> {
-    let korean = ShapedScript::Korean { serif };
-    let japanese = ShapedScript::Japanese { serif };
-    if is_hangul(c) {
-        return script_has(korean, c).then_some(korean);
-    }
-    if !is_kana_or_han(c) {
+    if matches!(c, '\n' | '\r' | '\t') || crate::win_ansi_encodable(c) || latin_has(c) || crate::shaped_text::is_thai(c) {
         return None;
     }
-    [japanese, korean].into_iter().find(|script| script_has(*script, c))
+    let korean = || Some(ShapedScript::Korean { serif }).filter(|script| script_has(*script, c));
+    let japanese = || Some(ShapedScript::Japanese { serif }).filter(|script| script_has(*script, c));
+    if is_hangul(c) {
+        korean()
+    } else if is_cjk(c) {
+        japanese().or_else(korean)
+    } else {
+        korean().or_else(japanese)
+    }
+}
+
+/// [`cjk_script`] for text that isn't serif: the Gothic faces.
+pub fn cjk_fallback(c: char) -> Option<ShapedScript> {
+    cjk_script(c, false)
 }
 
 /// Shape a left-to-right run of Korean or Japanese `text` with the face of `script` (one
@@ -174,6 +193,17 @@ pub fn cjk_script(c: char, serif: bool) -> Option<ShapedScript> {
 /// lacks a character.
 pub fn shape_cjk(text: &str, script: ShapedScript) -> Result<Vec<ShapedCluster>, GlyphError> {
     shape_script(text, false, script)
+}
+
+/// Shape a run of Korean text (Hangul, and what [`cjk_fallback`] gives the Korean face) with the
+/// Gothic Korean document face. [`GlyphError::NoFont`] without the face.
+pub fn shape_korean(text: &str) -> Result<Vec<ShapedCluster>, GlyphError> {
+    shape_cjk(text, ShapedScript::Korean { serif: false })
+}
+
+/// Shape a run of kana and Han with the Gothic Japanese document face.
+pub fn shape_japanese(text: &str) -> Result<Vec<ShapedCluster>, GlyphError> {
+    shape_cjk(text, ShapedScript::Japanese { serif: false })
 }
 
 /// The scripts the bundled face's runs are shaped as.

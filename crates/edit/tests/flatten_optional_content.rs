@@ -314,13 +314,13 @@ fn unsupported_membership_keeps_undrawable_reply_without_refusing_flatten() {
         reply.remove(b"OC");
         reply.set(b"Subtype".to_vec(), Object::Name(b"FreeText".to_vec()));
         reply.set(b"IRT".to_vec(), Object::Ref(root));
-        reply.set(b"Contents".to_vec(), Object::String(pdfcraft_cos::PdfString::text("Հ")));
+        reply.set(b"Contents".to_vec(), Object::String(pdfcraft_cos::PdfString::text("ሰ")));
         if marked_appearance {
-            pdfcraft_fonts::set_undrawn_mark(&mut reply, Some('Հ'));
+            pdfcraft_fonts::set_undrawn_mark(&mut reply, Some('ሰ'));
         } else {
             reply.remove(b"AP");
         }
-        assert_eq!(pdfcraft_annot::appearance::undrawable_text(&reply).map(|(_, c)| c), Some('Հ'));
+        assert_eq!(pdfcraft_annot::appearance::undrawable_text(&reply).map(|(_, c)| c), Some('ሰ'));
         let reply = doc.add(Object::Dict(reply));
         let mut drawable = doc.get(root).as_dict().unwrap().clone();
         drawable.remove(b"OC");

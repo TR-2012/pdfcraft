@@ -236,7 +236,9 @@ impl Document {
                 let style = pdfcraft_edit::BlockStyle { sources, ..Default::default() };
                 let mut trial = work.clone();
                 match guard(|| pdfcraft_edit::rewrite_block(&mut trial, page, k, Some(&text), &style)) {
-                    Ok(Ok(pdfcraft_edit::LineEdit { substituted: None })) => {
+                    // Characters the paragraph's font lacks are set in a stand-in face, as a text
+                    // edit sets them; applying the edit says which (EditNotice::FontSubstituted).
+                    Ok(Ok(pdfcraft_edit::LineEdit { .. })) => {
                         work = trial;
                         rewrote = true;
                         edits.push(Edit::EditTextBlock { page, block: k, text, style });
@@ -245,7 +247,6 @@ impl Document {
                             out.pages.push(page);
                         }
                     }
-                    Ok(Ok(pdfcraft_edit::LineEdit { substituted: Some(_) })) => out.skip(Skip::MissingGlyphs, count),
                     Ok(Err(e)) => refused(&mut out, count, page, e.to_string()),
                     Err(panic) => refused(&mut out, count, page, panic),
                 }

@@ -41,6 +41,9 @@ pub(crate) struct Fonts<'a> {
     /// The name the list shows for the current choice.
     pub shown: String,
     pub mixed_size: bool,
+    /// Keep fonts, for a paragraph being edited (`None` for added text): when on, an edit that
+    /// would set any of the text in a font nobody chose is refused instead.
+    pub keep_fonts: Option<&'a mut bool>,
 }
 
 /// Text being typed in, for the alignment buttons: with some of it selected, they show and set the
@@ -261,6 +264,11 @@ pub(crate) fn panel(
     font_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, ui.is_enabled(), tl!("Font")));
     font_resp.on_hover_text(format!("{}\n{}", tl!("Font"), tl!("Thai and Arabic use regular fallback fonts when available.")));
     ui.add_space(4.0);
+    if let Some(keep) = fonts.keep_fonts {
+        ui.add(widgets::checkbox(keep, tl!("Keep fonts")))
+            .on_hover_text(tl!("Refuse an edit that would set any of the text in another font because the paragraph's font lacks some characters."));
+        ui.add_space(4.0);
+    }
 
     // Size and colour | bullets, numbering and alignment.
     let mut size_committed = false;
@@ -657,7 +665,7 @@ mod typed_size_tests {
                     ready = true;
                     return;
                 }
-                let fonts = Fonts { sources: Some(&[]), shown: tl!("Mixed").into(), mixed_size: true };
+                let fonts = Fonts { sources: Some(&[]), shown: tl!("Mixed").into(), mixed_size: true, keep_fonts: None };
                 panel(ui, &Tokens::get(ui.ctx()), look, None, fonts, None);
             },
             AddedText::default(),

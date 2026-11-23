@@ -246,25 +246,22 @@ fn fill_with(doc: &mut Document, name: &str, value: &str) {
 }
 
 /// Month names in the date language that no font of the field can draw are drawn in English,
-/// never as `?` ("18-??-26" in Japanese); a font that holds them keeps them (#5303). Russian,
+/// never as `?` ("18-??-26" in Hindi); a font that holds them keeps them (#5303). Russian,
 /// Czech and Greek names keep theirs in a Helvetica field too: the bundled Inter face draws the
-/// letters Helvetica lacks (#6822).
+/// letters Helvetica lacks (#6822). Japanese ones are drawn from the Japanese (or Korean) face
+/// where the build has one.
 #[test]
 fn date_names_no_field_font_can_draw_are_drawn_in_english() {
     let _names = names_lock();
     let date = "AFDate_FormatEx(\"dd-mmm-yy\");";
     let fields = [("helv", "Helv", date), ("song", "Song", date)];
-    for (language, local) in [("ru", "окт."), ("cs", "říj"), ("ja", "10月"), ("el", "Οκτ")] {
+    for (language, local) in [("ru", "окт."), ("cs", "říj"), ("hi", "अक्तू॰"), ("el", "Οκτ")] {
         use_form_date_language(language);
         let mut doc = form(&fields);
         fill(&mut doc, "helv");
         fill(&mut doc, "song");
         let helv = appearance(&doc, "helv");
-        if language == "ja" && pdfcraft_fonts::shaped_text::cjk_fallback('月') {
-            // A build with a Japanese or Korean craft-fonts face draws 月 beside Helvetica.
-            assert!(contains(&helv, b"(18-10) Tj") && contains(&helv, b"/PCCj"), "{language}: {}", String::from_utf8_lossy(&helv));
-            assert!(!contains(&helv, b"Oct"), "{language} keeps its name: {}", String::from_utf8_lossy(&helv));
-        } else if language == "ja" {
+        if language == "hi" {
             assert!(contains(&helv, b"(18-Oct-26) Tj"), "{language}: {}", String::from_utf8_lossy(&helv));
         } else {
             assert!(contains(&helv, b"(18-) Tj") && contains(&helv, b"/PCLa"), "{language}: {}", String::from_utf8_lossy(&helv));
@@ -275,6 +272,17 @@ fn date_names_no_field_font_can_draw_are_drawn_in_english() {
         let song = appearance(&doc, "song");
         assert!(contains(&song, &ucs2(&format!("18-{local}-26"))), "{language} keeps its name: {song:?}");
     }
+    // Japanese: drawn from a bundled face where the build has one for 月, else in English.
+    use_form_date_language("ja");
+    let mut doc = form(&fields);
+    fill(&mut doc, "helv");
+    let helv = appearance(&doc, "helv");
+    if pdfcraft_fonts::cjk_fallback('月').is_some() {
+        assert!(contains(&helv, b"/PCLa") && !contains(&helv, b"Oct"), "ja keeps its name: {}", String::from_utf8_lossy(&helv));
+    } else {
+        assert!(contains(&helv, b"(18-Oct-26) Tj"), "{}", String::from_utf8_lossy(&helv));
+    }
+    assert!(!helv.contains(&b'?') && pdfcraft_forms::undrawn_fields(&doc).is_empty(), "{}", String::from_utf8_lossy(&helv));
     // Names Helvetica holds are kept: Italian "ott".
     use_form_date_language("it");
     let mut doc = form(&fields);
@@ -290,32 +298,23 @@ fn format_scripts_print_dates_in_english_where_the_field_cannot_draw_them() {
     let _names = names_lock();
     let script = "event.value = event.value ? util.printd(\"dd-mmm-yy\", util.scand(\"dd-mm-yy\", event.value)) + \" !\" : \"\";";
     let fields = [("helv", "Helv", script), ("song", "Song", script)];
-    // Japanese: no font of a Helvetica field draws 月, the bundled Inter face included.
-    use_form_date_language("ja");
+    // Hindi: no font of a Helvetica field draws अ, the bundled faces included.
+    use_form_date_language("hi");
     let mut doc = form(&fields);
     fill(&mut doc, "helv");
     fill(&mut doc, "song");
     let helv = appearance(&doc, "helv");
-    if pdfcraft_fonts::shaped_text::cjk_fallback('月') {
-        // A build with a Japanese or Korean craft-fonts face draws 月 beside Helvetica, so the
-        // date keeps its language, as the Russian one does below.
-        assert!(contains(&helv, b"(18-10) Tj") && contains(&helv, b"/PCCj") && !contains(&helv, b"Oct"), "{}", String::from_utf8_lossy(&helv));
-    } else {
-        assert!(contains(&helv, b"(18-Oct-26 !) Tj"), "{}", String::from_utf8_lossy(&helv));
-    }
+    assert!(contains(&helv, b"(18-Oct-26 !) Tj"), "{}", String::from_utf8_lossy(&helv));
     assert!(!helv.contains(&b'?'), "{}", String::from_utf8_lossy(&helv));
     assert!(pdfcraft_forms::undrawn_fields(&doc).is_empty());
-    assert!(contains(&appearance(&doc, "song"), &ucs2("18-10月-26 !")));
+    assert!(contains(&appearance(&doc, "song"), &ucs2("18-अक्तू॰-26 !")));
     // A script whose text has no English either keeps it, reported as undrawn.
-    let greeting = [("hi", "Helv", "event.value = \"你好 \" + util.printd(\"mmm\", new Date(2026, 9, 18));")];
+    let greeting = [("hi", "Helv", "event.value = \"ሰላም \" + util.printd(\"mmm\", new Date(2026, 9, 18));")];
     let mut doc = form(&greeting);
     fill(&mut doc, "hi");
-    // A build with Japanese and Korean craft-fonts faces draws what they hold beside Helvetica,
-    // so only a character none of them has is reported.
-    let first_undrawn = "你好月".chars().find(|c| !pdfcraft_fonts::shaped_text::cjk_fallback(*c));
-    let reported: Vec<(String, char)> = first_undrawn.map(|c| ("hi".to_string(), c)).into_iter().collect();
-    assert_eq!(pdfcraft_forms::undrawn_fields(&doc), reported);
+    assert_eq!(pdfcraft_forms::undrawn_fields(&doc), [("hi".to_string(), 'ሰ')]);
     // The English run is the appearance's alone: scripts go on printing the date language.
+    use_form_date_language("ja");
     assert_eq!(printd("dd-mmm-yy", "18-10月-26"), "18-10月-26|18-10月-26");
     // Russian names a Helvetica field draws from the bundled face need no English run (#6822).
     use_form_date_language("ru");
@@ -334,25 +333,16 @@ fn format_scripts_print_dates_in_english_where_the_field_cannot_draw_them() {
 fn an_english_run_that_prints_the_stored_value_is_drawn() {
     let _names = names_lock();
     let script = "event.value = util.printd(\"dd-mmm-yy\", util.scand(\"dd-mmm-yy\", event.value));";
-    // Japanese, whose 月 no font of a Helvetica field draws (#6822 draws Russian there).
-    use_form_date_language("ja");
+    // Hindi, whose अ no font of a Helvetica field draws (#6822 draws Russian there).
+    use_form_date_language("hi");
     let mut doc = form(&[("helv", "Helv", script), ("fails", "Helv", "throw new Error(\"no\");")]);
     fill_with(&mut doc, "helv", "18-Oct-26");
     let helv = appearance(&doc, "helv");
-    if pdfcraft_fonts::shaped_text::cjk_fallback('月') {
-        // A build with a Japanese or Korean craft-fonts face draws 月 beside Helvetica, so the
-        // date keeps its language, as the Russian one does below.
-        assert!(contains(&helv, b"(18-10) Tj") && contains(&helv, b"/PCCj") && !contains(&helv, b"Oct"), "{}", String::from_utf8_lossy(&helv));
-    } else {
-        assert!(contains(&helv, b"(18-Oct-26) Tj"), "{}", String::from_utf8_lossy(&helv));
-    }
+    assert!(contains(&helv, b"(18-Oct-26) Tj"), "{}", String::from_utf8_lossy(&helv));
     assert!(!helv.contains(&b'?'), "{}", String::from_utf8_lossy(&helv));
     assert!(pdfcraft_forms::undrawn_fields(&doc).is_empty());
-    fill_with(&mut doc, "fails", "18-10月-26");
-    // 月 is reported unless the build has a Japanese or Korean craft-fonts face, which draws it.
-    let reported: Vec<(String, char)> =
-        if pdfcraft_fonts::shaped_text::cjk_fallback('月') { Vec::new() } else { vec![("fails".to_string(), '月')] };
-    assert_eq!(pdfcraft_forms::undrawn_fields(&doc), reported);
+    fill_with(&mut doc, "fails", "18-अक्तू॰-26");
+    assert_eq!(pdfcraft_forms::undrawn_fields(&doc), [("fails".to_string(), 'अ')]);
     use_form_date_language("en");
 }
 

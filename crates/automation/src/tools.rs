@@ -1767,7 +1767,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "dy": { "type": "number", "description": "Paragraph only: move up by this many points (negative: down)." },
                     "width": { "type": "number", "description": "Paragraph only: rewrap to this width in points (dragging the box's edge)." },
                     "char_spacing": { "type": "number", "description": "Points." },
-                    "scale": { "type": "number", "description": "Horizontal scale in percent." } }),
+                    "scale": { "type": "number", "description": "Horizontal scale in percent." },
+                    "keep_fonts": { "type": "boolean", "description": "Paragraph only: refuse the edit, changing nothing, when any of the text would be set in a font that wasn't chosen (a standard or fallback face standing in for characters the paragraph's font lacks). Default false: the stand-in is used and the result's font shows it." } }),
                 &["doc", "page"],
             )),
         t("text_script", "Superscript or subscript", "Format text ▸ Superscript or Subscript on one paragraph (paragraph, from text_paragraphs), or on range [start, end): UTF-8 byte offsets of its editor_text. The characters take the Unicode superscript or subscript forms (2 → ², 2 → ₂; the font must have those glyphs, and extracted text contains them); text already in that script goes back to plain characters. Characters Unicode has no such form for (q, a space) stay unchanged and do not determine the selection's script state. Mixed plain and target-script characters normalize to that script, then to plain text on the next call (H₂2 → H₂₂ → H22); a second toggle does not reconstruct the original mixture. Use Undo to restore the exact prior text. The paragraph is then rewritten as text_edit rewrites it, with the same result fields. Refused when no character would change. Undoable. Mathematical minus U+2212 has its own script mapping; ASCII hyphen-minus stays unchanged.")

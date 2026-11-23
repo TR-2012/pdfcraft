@@ -15,8 +15,18 @@ pub struct FontFile {
     pub face_index: u32,
 }
 
-/// Standard user-installed font folders; discovery is performed only on request.
+/// Standard user-installed font folders, and the `fonts` folder beside the executable (a
+/// portable copy's own fonts); discovery is performed only on request.
 pub fn installed_directories() -> Vec<PathBuf> {
+    let mut dirs = system_directories();
+    // Last, so the scan (which takes roots from the end) lists the app's own folder first.
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("fonts"))).filter(|d| d.is_dir()) {
+        dirs.push(dir);
+    }
+    dirs
+}
+
+fn system_directories() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if cfg!(target_os = "macos") {
         let mut dirs = vec![PathBuf::from("/Library/Fonts")];
@@ -40,7 +50,7 @@ pub fn installed_directories() -> Vec<PathBuf> {
 }
 
 /// The total size of the fonts one scan lists.
-const SCAN_BUDGET: u64 = 64 << 20;
+const SCAN_BUDGET: u64 = 256 << 20;
 
 /// The same in a build that accepts any document font: every installed font qualifies there, and
 /// a machine's font folder holds a gigabyte or more of them.

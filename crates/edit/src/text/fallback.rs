@@ -414,20 +414,25 @@ fn no_hebrew_font() -> EditError {
 }
 
 /// The faces a Type 3 replacement may draw `text` with, best first. Text with Hebrew takes the
-/// Hebrew face first (its Latin and digits too, so a line keeps one look), then the Japanese faces
-/// and the bundled Latin one for anything it lacks; other text takes the Japanese faces, and the
-/// bundled Latin face behind them, which covers the Latin, Greek and Cyrillic letters they lack
-/// (#2593: the Japanese faces have no қ, ғ, ҳ, ә, ө, ү, ұ or һ). Text with Hangul takes the Korean
-/// faces before the Japanese ones, which have no Hangul (its Latin, digits and Hanja too, so a line
-/// keeps one look); text without Hangul never sees them. Serif text takes a Myeongjo face where the
-/// build has one, as it takes a Mincho face for Japanese.
+/// Hebrew face first (its Latin and digits too, so a line keeps one look); text with Hangul takes
+/// the Korean faces first (without them a Hangul character had no face at all); other text takes the
+/// Japanese faces, and the bundled Latin face behind them, which covers the Latin, Greek and
+/// Cyrillic letters they lack (#2593: the Japanese faces have no қ, ғ, ҳ, ә, ө, ү, ұ or һ). The
+/// Korean, Chinese and symbol faces follow, so a character one face lacks is taken from the next
+/// face that has it instead of failing the edit.
 pub(crate) fn type3_faces(text: &str, family: crate::added::Family, bold: bool) -> Result<(Vec<&'static CraftFont>, bool), EditError> {
     let serif = family == crate::added::Family::Times;
     let japanese = pdfcraft_fonts::document_japanese_fonts_for_style(serif, bold);
     let latin = pdfcraft_fonts::document_latin_fonts(bold);
-    let korean = if text.chars().any(needs_korean) { pdfcraft_fonts::document_korean_fonts_for_style(serif, bold) } else { Vec::new() };
+    let korean = pdfcraft_fonts::document_korean_fonts_for_style(serif, bold);
+    let rest = pdfcraft_fonts::document_chinese_fonts().into_iter().chain(pdfcraft_fonts::document_symbol_fonts());
     if !text.chars().any(crate::bidi::is_hebrew) {
-        return Ok((korean.into_iter().chain(japanese).chain(latin).collect(), false));
+        let faces: Vec<&'static CraftFont> = if text.chars().any(is_hangul) {
+            korean.into_iter().chain(japanese).chain(latin).chain(rest).collect()
+        } else {
+            japanese.into_iter().chain(latin).chain(korean).chain(rest).collect()
+        };
+        return Ok((faces, false));
     }
     // Points are drawn on their letter with the font's positioning, which a one-glyph-per-
     // character Type 3 font can't do; refuse rather than print them beside the letter. A build
@@ -441,7 +446,12 @@ pub(crate) fn type3_faces(text: &str, family: crate::added::Family, bold: bool) 
     if hebrew.is_none() && !draws_undrawable_characters() {
         return Err(no_hebrew_font());
     }
-    Ok((hebrew.into_iter().chain(korean).chain(japanese).chain(latin).collect(), true))
+    Ok((hebrew.into_iter().chain(japanese).chain(latin).chain(korean).chain(rest).collect(), true))
+}
+
+/// Hangul: the jamo, compatibility jamo, extended jamo and the precomposed syllables.
+pub(crate) fn is_hangul(ch: char) -> bool {
+    pdfcraft_fonts::is_hangul(ch)
 }
 
 pub(super) fn type3_font(
@@ -475,10 +485,9 @@ pub(super) fn type3_font(
     }
     let face = if hebrew { faces.first().copied() } else { fallback_face(&faces, &named, |face, ch| japanese_glyph_from(face, ch).is_ok()) }
         .ok_or_else(|| no_fallback_font(text))?;
-    // Korean text does the same as Hebrew: a kanji the Korean face lacks comes from a Japanese face.
-    let takes_missing_from_other_faces = hebrew || text.chars().any(needs_korean);
-    let others: Vec<&CraftFont> =
-        if takes_missing_from_other_faces { faces.iter().copied().filter(|f| !std::ptr::eq(*f, face)).collect() } else { Vec::new() };
+    // Every other face, in order: a character the chosen face lacks comes from the next face
+    // that has it (Hangul in a Japanese line, a symbol in a Korean one), instead of failing.
+    let others: Vec<&CraftFont> = faces.iter().copied().filter(|f| !std::ptr::eq(*f, face)).collect();
     // Every outline is read before the document is touched, so a character that fails leaves it
     // as it was. Each font takes the next `per_font` characters; codes restart at 1 in each.
     let per_font = max_glyphs.clamp(1, MAX_TYPE3_GLYPHS);
@@ -487,8 +496,7 @@ pub(super) fn type3_font(
         let drawn = if is_variation_selector(ch) {
             Some((SELECTOR_GLYPH_PROC.to_vec(), 0.0))
         } else {
-            // The chosen face first, then the faces after it (Hebrew text takes a character the
-            // Hebrew face lacks from the next face that has it); a character no face draws is
+            // The chosen face first, then the other faces in order; a character no face draws is
             // reported once.
             let mut drawn = type3_glyph(face, ch)?;
             for f in others.iter().copied() {

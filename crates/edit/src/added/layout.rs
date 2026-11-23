@@ -319,7 +319,8 @@ pub fn first_undrawable(t: &AddedText) -> Option<char> {
 /// Whether `t` has Arabic or Hebrew that its craft-fonts face draws (so `draw` lays it out with
 /// [`draw_shaped`]).
 fn shaped_by_a_face(t: &AddedText) -> bool {
-    (pdfcraft_fonts::document_arabic_font().is_some() && t.text.chars().any(is_arabic))
+    t.text.chars().any(|c| pdfcraft_fonts::cjk_fallback(c).is_some())
+        || (pdfcraft_fonts::document_arabic_font().is_some() && t.text.chars().any(is_arabic))
         || (pdfcraft_fonts::document_hebrew_font(false).is_some() && t.text.chars().any(is_hebrew))
         || has_cjk(t)
 }
@@ -373,6 +374,9 @@ pub(super) fn shaped_layout(t: &AddedText, line: &str, rtl: bool) -> Result<(Vec
             let after_hebrew = segments.last().is_some_and(|(kind, _)| *kind == Some(ShapedScript::Hebrew));
             let script = if is_thai(c) {
                 Some(ShapedScript::Thai)
+            } else if let Some(cjk) = pdfcraft_fonts::cjk_fallback(c) {
+                // Hangul, kana, Han and the symbols only the Korean or Japanese face has.
+                Some(cjk)
             } else if is_hebrew(c) || (run_rtl && after_hebrew && !c.is_alphanumeric() && pdfcraft_fonts::hebrew_has(c)) {
                 Some(ShapedScript::Hebrew)
             } else if is_arabic(c) || (run_rtl && !c.is_alphanumeric() && pdfcraft_fonts::arabic_has(c)) {

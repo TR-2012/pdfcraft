@@ -197,6 +197,18 @@ pub fn document_japanese_fonts_for_style(serif: bool, bold: bool) -> Vec<&'stati
     document_faces(CRAFT_FONTS, serif, bold)
 }
 
+/// The Chinese craft-fonts faces (`Hans`, `Hant`) that can stand in for Han characters the
+/// Japanese and Korean faces lack, in manifest order.
+pub fn document_chinese_fonts() -> Vec<&'static CraftFont> {
+    CRAFT_FONTS.iter().filter(|f| f.covers("Hans") || f.covers("Hant") || f.scripts.iter().any(|s| s.starts_with("Hant-"))).collect()
+}
+
+/// The symbol craft-fonts faces (`Zsym`: arrows, dingbats, shapes), the last resort for a
+/// character no text face has, in manifest order.
+pub fn document_symbol_fonts() -> Vec<&'static CraftFont> {
+    CRAFT_FONTS.iter().filter(|f| f.covers("Zsym")).collect()
+}
+
 /// The scripts the bundled Inter faces are for.
 static LATIN_SCRIPTS: &[&str] = &["Latn", "Cyrl", "Grek"];
 
@@ -273,6 +285,26 @@ pub static SHIPPORI_MINCHO: Option<&[u8]> = find("Shippori Mincho", "Regular");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Korean faces for document text put the requested serif/sans and weight first.
+    #[test]
+    fn korean_faces_follow_the_requested_style() {
+        static BYTES: &[u8] = b"fake";
+        static KORE: &[&str] = &["Hang", "Kore"];
+        static JPAN: &[&str] = &["Jpan"];
+        let faces = [
+            CraftFont { family: "NanumGothic", style: "Regular", scripts: KORE, bytes: BYTES },
+            CraftFont { family: "BIZ UDPGothic", style: "Regular", scripts: JPAN, bytes: BYTES },
+            CraftFont { family: "NanumGothic", style: "Bold", scripts: KORE, bytes: BYTES },
+            CraftFont { family: "NanumMyeongjo", style: "Regular", scripts: KORE, bytes: BYTES },
+            CraftFont { family: "NanumMyeongjo", style: "Bold", scripts: KORE, bytes: BYTES },
+        ];
+        let names = |serif, bold| korean_faces(&faces, serif, bold).iter().map(|f| f.name()).collect::<Vec<_>>();
+        assert_eq!(names(false, false), ["NanumGothic Regular", "NanumGothic Bold", "NanumMyeongjo Regular", "NanumMyeongjo Bold"]);
+        assert_eq!(names(false, true), ["NanumGothic Bold", "NanumGothic Regular", "NanumMyeongjo Bold", "NanumMyeongjo Regular"]);
+        assert_eq!(names(true, false), ["NanumMyeongjo Regular", "NanumMyeongjo Bold", "NanumGothic Regular", "NanumGothic Bold"]);
+        assert_eq!(names(true, true), ["NanumMyeongjo Bold", "NanumMyeongjo Regular", "NanumGothic Bold", "NanumGothic Regular"]);
+    }
 
     #[test]
     fn cjk_fallback_order_follows_the_ui_language() {

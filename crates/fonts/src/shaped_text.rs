@@ -2,15 +2,14 @@
 //! text it stands for) becomes one glyph of a Type 3 font drawn from the craft-fonts face's
 //! outlines, with a `/ToUnicode` map so copy and search get each character once. No font file is
 //! embedded. Add text writes Arabic, Hebrew, Thai, Korean and Japanese with it; text boxes, Fill &
-//! Sign text, form fields, headers, footers and watermarks write Thai with it, beside the standard
-//! font that draws the rest ([`thai_pieces`]), and text boxes and form fields write Korean and
-//! Japanese with it too ([`fallback_pieces`]).
+//! Sign text, form fields, headers, footers and watermarks write Thai, Korean and Japanese with it,
+//! beside the standard font that draws the rest ([`thai_pieces`]).
 
 use std::collections::{HashMap, HashSet};
 
 use pdfcraft_cos::{Dict, Document, Object, PdfString, Stream};
 
-use crate::{GlyphError, GlyphOutline, ShapedCluster, ShapedScript, latin_has, literal, shape_latin, shape_thai, shaped_glyph};
+use crate::{GlyphError, GlyphOutline, ShapedCluster, ShapedScript, cjk_fallback, latin_has, literal, shape_latin, shape_thai, shaped_glyph};
 
 /// Most glyphs in one Type 3 font: its codes are single bytes, 1–240. Text gets one such font per
 /// 240 distinct clusters it needs.
@@ -19,6 +18,50 @@ pub const GLYPHS_PER_FONT: usize = 240;
 /// The Thai block (U+0E00–U+0E7F): letters, vowels, tone marks, digits and signs.
 pub fn is_thai(c: char) -> bool {
     matches!(u32::from(c), 0x0E00..=0x0E7F)
+}
+
+/// Whether a generated appearance draws `c` from a shaped face rather than the standard font:
+/// Thai, or a character only the Korean or Japanese face has ([`cjk_fallback`]).
+pub fn needs_shaping(c: char) -> bool {
+    is_thai(c) || cjk_fallback(c).is_some() || last_resort_draws(c)
+}
+
+/// Whether `c` is left to the last resort (`crate::last_resort`): a character the standard font
+/// has no code for and no face here draws, in a build that draws such characters instead of
+/// writing `?` for them.
+fn last_resort_draws(c: char) -> bool {
+    crate::last_resort::draws() && crate::last_resort::takes(c) && !is_thai(c) && cjk_fallback(c).is_none()
+}
+
+/// A run of `script` shaped with its face.
+///
+/// What the face can't shape (the build has no such face, or it lacks a character) is drawn
+/// character by character by the last resort, where the build has it, instead of failing the line.
+fn shape_run(script: ShapedScript, text: &str) -> Result<Vec<ShapedCluster>, GlyphError> {
+    let shaped = match script {
+        ShapedScript::Korean { .. } | ShapedScript::Japanese { .. } => crate::shape_cjk(text, script),
+        ShapedScript::Thai => shape_thai(text),
+        ShapedScript::LastResort => Ok(crate::last_resort::shape(text, false)),
+        _ => shape_latin(text),
+    };
+    match shaped {
+        Err(_) if crate::last_resort::draws() => Ok(crate::last_resort::shape(text, false)),
+        shaped => shaped,
+    }
+}
+
+/// Why shaped text can't be drawn: [`thai_message`] for Thai, else about the Korean or Japanese face.
+pub fn shaped_message(e: GlyphError, text: &str) -> String {
+    if text.chars().any(is_thai) {
+        return thai_message(e, text);
+    }
+    match e {
+        GlyphError::NoFont => "this text needs PdfCraft's Korean or Japanese font, which this build doesn't include \
+                               (to build them in, set CRAFT_FONTS_DIR to a craft-fonts checkout)"
+            .into(),
+        GlyphError::Missing => format!("the Korean and Japanese fonts can't show \"{text}\""),
+        GlyphError::TooComplex => "the glyphs are too complex; use shorter text".into(),
+    }
 }
 
 /// Thai vowel signs and tone marks drawn on the consonant before them, and Sara Am, which the
@@ -45,6 +88,12 @@ pub fn latin_fallback(c: char) -> bool {
     !matches!(c, '\n' | '\r') && !is_thai(c) && !crate::win_ansi_encodable(c) && latin_has(c)
 }
 
+/// Whether a generated appearance with the bundled face's fallback draws `c` from a face beside
+/// the standard font: [`latin_fallback`], or the Korean or Japanese face ([`cjk_fallback`]).
+pub fn fallback_draws(c: char) -> bool {
+    latin_fallback(c) || (!matches!(c, '\n' | '\r') && cjk_fallback(c).is_some()) || last_resort_draws(c)
+}
+
 /// Why the bundled Inter face can't draw `text`, for a message an agent or user can act on.
 pub fn latin_message(e: GlyphError, text: &str) -> String {
     match e {
@@ -53,50 +102,30 @@ pub fn latin_message(e: GlyphError, text: &str) -> String {
     }
 }
 
-/// Whether a generated appearance can draw `c` from a Korean or Japanese craft-fonts face (the
-/// Gothic ones): Hangul, kana, Han ideographs or CJK punctuation that a face of this build has.
-/// False for everything else, and in a build without those faces.
-pub fn cjk_fallback(c: char) -> bool {
-    crate::cjk_script(c, false).is_some()
-}
-
 /// `line` split as a generated appearance draws it, in typing order: with `thai`, its Thai runs
-/// shaped with the Thai face; with `cjk`, its runs of [`cjk_fallback`] characters shaped with the
-/// Korean and Japanese faces; with `latin`, its runs of [`latin_fallback`] characters shaped with
+/// shaped with the Thai face; with `latin`, its runs of [`latin_fallback`] characters shaped with
 /// the bundled Inter face; and the text between them, left to the standard font. An error when a
 /// run can't be shaped (no Thai face, a missing character).
-///
-/// In a build that draws what nothing has a glyph for ([`crate::last_resort::draws`]), the
-/// characters the standard font has no code for and none of those faces took are drawn by the
-/// last resort, with `latin` or `cjk`, and so is a run its face can't shape: no error then.
-pub fn fallback_pieces(line: &str, thai: bool, latin: bool, cjk: bool) -> Result<Vec<Piece>, GlyphError> {
+pub fn fallback_pieces(line: &str, thai: bool, latin: bool) -> Result<Vec<Piece>, GlyphError> {
     #[derive(Clone, Copy, PartialEq)]
     enum Run {
         Thai,
         Latin,
         Cjk(ShapedScript),
-        LastResort,
         Standard,
     }
-    let last_resort = crate::last_resort::draws();
     let kind = |c: char| {
         if thai && is_thai(c) {
             Run::Thai
-        } else if let Some(script) = crate::cjk_script(c, false).filter(|_| cjk) {
-            Run::Cjk(script)
         } else if latin && latin_fallback(c) {
             Run::Latin
-        } else if last_resort && (latin || cjk) && crate::last_resort::takes(c) {
-            Run::LastResort
+        } else if let Some(script) = cjk_fallback(c) {
+            Run::Cjk(script)
+        } else if last_resort_draws(c) {
+            Run::Cjk(ShapedScript::LastResort)
         } else {
             Run::Standard
         }
-    };
-    // What a face can't shape (the build has no such face, or it lacks a character) is drawn
-    // character by character instead of failing the line.
-    let or_last_resort = |shaped: Result<Vec<ShapedCluster>, GlyphError>, text: &str| match shaped {
-        Err(_) if last_resort => Ok(crate::last_resort::shape(text, false)),
-        other => other,
     };
     let mut runs: Vec<(Run, String)> = Vec::new();
     for c in line.chars() {
@@ -125,10 +154,9 @@ pub fn fallback_pieces(line: &str, thai: bool, latin: bool, cjk: bool) -> Result
     }
     runs.into_iter()
         .map(|(run, s)| match run {
-            Run::Thai => or_last_resort(shape_thai(&s), &s).map(Piece::Shaped),
-            Run::Latin => or_last_resort(shape_latin(&s), &s).map(Piece::Shaped),
-            Run::Cjk(script) => or_last_resort(crate::shape_cjk(&s, script), &s).map(Piece::Shaped),
-            Run::LastResort => Ok(Piece::Shaped(crate::last_resort::shape(&s, false))),
+            Run::Thai => shape_run(ShapedScript::Thai, &s).map(Piece::Shaped),
+            Run::Latin => shape_run(ShapedScript::Latin, &s).map(Piece::Shaped),
+            Run::Cjk(script) => shape_run(script, &s).map(Piece::Shaped),
             Run::Standard => Ok(Piece::Latin(s)),
         })
         .collect()
@@ -142,14 +170,11 @@ fn is_mark(c: char) -> bool {
 /// The width of `text` at `size` as [`fallback_pieces`] splits it, the standard font's pieces
 /// measured by `standard`. Text with nothing for the fallback faces, or that they can't shape, is
 /// measured by `standard` as a whole (drawing then reports why).
-pub fn fallback_width(text: &str, size: f64, thai: bool, latin: bool, cjk: bool, standard: impl Fn(&str, f64) -> f64) -> f64 {
-    let last_resort = (latin || cjk) && crate::last_resort::draws();
-    let needs =
-        |c: char| (thai && is_thai(c)) || (latin && latin_fallback(c)) || (cjk && cjk_fallback(c)) || (last_resort && crate::last_resort::takes(c));
-    if !text.chars().any(needs) {
+pub fn fallback_width(text: &str, size: f64, thai: bool, latin: bool, standard: impl Fn(&str, f64) -> f64) -> f64 {
+    if !text.chars().any(|c| (thai && is_thai(c)) || (latin && latin_fallback(c)) || cjk_fallback(c).is_some() || last_resort_draws(c)) {
         return standard(text, size);
     }
-    match fallback_pieces(text, thai, latin, cjk) {
+    match fallback_pieces(text, thai, latin) {
         Ok(pieces) => pieces_width(&pieces, size, 0.0, standard),
         Err(_) => standard(text, size),
     }
@@ -167,20 +192,30 @@ pub enum Piece {
 /// the standard font. Thai runs left to right, so the pieces are in typing order.
 /// [`GlyphError::NoFont`] when there's Thai and this build has no Thai face.
 pub fn thai_pieces(line: &str) -> Result<Vec<Piece>, GlyphError> {
-    let mut runs: Vec<(bool, String)> = Vec::new();
+    // The face each character takes: Thai, Korean or Japanese ([`cjk_fallback`]), or none (the
+    // standard font).
+    let last_resort = |c: char| last_resort_draws(c).then_some(ShapedScript::LastResort);
+    let kind = |c: char| if is_thai(c) { Some(ShapedScript::Thai) } else { cjk_fallback(c).or_else(|| last_resort(c)) };
+    let mut runs: Vec<(Option<ShapedScript>, String)> = Vec::new();
     for c in line.chars() {
+        let k = kind(c);
         match runs.last_mut() {
-            Some((thai, s)) if *thai == is_thai(c) => s.push(c),
-            _ => runs.push((is_thai(c), c.to_string())),
+            Some((run, s)) if *run == k => s.push(c),
+            _ => runs.push((k, c.to_string())),
         }
     }
-    runs.into_iter().map(|(thai, s)| if thai { shape_thai(&s).map(Piece::Shaped) } else { Ok(Piece::Latin(s)) }).collect()
+    runs.into_iter()
+        .map(|(run, s)| match run {
+            Some(script) => shape_run(script, &s).map(Piece::Shaped),
+            None => Ok(Piece::Latin(s)),
+        })
+        .collect()
 }
 
 /// The width of `text` at `size`: its Thai shaped, the rest measured by `latin`. Text the Thai
 /// face can't shape is measured by `latin` as a whole (drawing then reports why).
 pub fn thai_width(text: &str, size: f64, latin: impl Fn(&str, f64) -> f64) -> f64 {
-    if !text.chars().any(is_thai) {
+    if !text.chars().any(needs_shaping) {
         return latin(text, size);
     }
     match thai_pieces(text) {
@@ -361,33 +396,20 @@ impl ShapedFonts {
 /// appearance. Thai the face can't draw, and every line when a glyph can't be read, is left to the
 /// standard font, whose encoder writes `?` for it; [`first_undrawable`] reports that.
 pub fn appearance_lines(lines: &[String], fonts: &mut Dict) -> (Vec<Vec<Piece>>, ShapedFonts) {
-    // Korean and Japanese are drawn the same way, from their craft-fonts faces.
-    fallback_appearance_lines(lines, true, false, true, fonts)
+    fallback_appearance_lines(lines, true, false, fonts)
 }
 
 /// [`appearance_lines`] with the pieces [`fallback_pieces`] splits each line into: its Thai with
 /// `thai`, and with `latin` the Latin, Greek and Cyrillic characters the standard fonts lack, drawn
-/// from the bundled Inter face, and with `cjk` the Korean and Japanese the craft-fonts faces draw
-/// ([`cjk_fallback`]). Their Type 3 fonts are named `PCTh…` when Thai is drawn, else `PCCj…` when
-/// Korean or Japanese is, else `PCLa…`. A line whose runs can't be shaped, and every line when a
-/// glyph can't be read, is left to the standard font, which writes `?` for what it lacks; the
-/// caller reports that.
-pub fn fallback_appearance_lines(lines: &[String], thai: bool, latin: bool, cjk: bool, fonts: &mut Dict) -> (Vec<Vec<Piece>>, ShapedFonts) {
+/// from the bundled Inter face. Their Type 3 fonts are named `PCTh…` when Thai is drawn, else
+/// `PCLa…`. A line whose runs can't be shaped, and every line when a glyph can't be read, is left
+/// to the standard font, which writes `?` for what it lacks; the caller reports that.
+pub fn fallback_appearance_lines(lines: &[String], thai: bool, latin: bool, fonts: &mut Dict) -> (Vec<Vec<Piece>>, ShapedFonts) {
     let plain = |l: &String| vec![Piece::Latin(l.clone())];
-    let last_resort = (latin || cjk) && crate::last_resort::draws();
-    let needs =
-        |c: char| (thai && is_thai(c)) || (latin && latin_fallback(c)) || (cjk && cjk_fallback(c)) || (last_resort && crate::last_resort::takes(c));
-    let pieces: Vec<Vec<Piece>> = lines
-        .iter()
-        .map(|l| if l.chars().any(needs) { fallback_pieces(l, thai, latin, cjk).unwrap_or_else(|_| plain(l)) } else { plain(l) })
-        .collect();
-    let prefix = if thai {
-        "PCTh"
-    } else if cjk && lines.iter().any(|l| l.chars().any(cjk_fallback)) {
-        "PCCj"
-    } else {
-        "PCLa"
-    };
+    let needs = |c: char| (thai && is_thai(c)) || (latin && latin_fallback(c)) || cjk_fallback(c).is_some() || last_resort_draws(c);
+    let pieces: Vec<Vec<Piece>> =
+        lines.iter().map(|l| if l.chars().any(needs) { fallback_pieces(l, thai, latin).unwrap_or_else(|_| plain(l)) } else { plain(l) }).collect();
+    let prefix = if thai { "PCTh" } else { "PCLa" };
     match ShapedFonts::new(clusters(pieces.iter().map(Vec::as_slice)), shaped_glyph, &Dict::new(), fonts, prefix, &mut |o| o).map_err(|(e, _)| e) {
         Ok(shaped) => (pieces, shaped),
         Err(_) => (lines.iter().map(plain).collect(), ShapedFonts::default()),
@@ -402,7 +424,7 @@ pub fn thai_reach(line: &str) -> Option<[f64; 2]> {
     }
     let pieces = thai_pieces(line).ok()?;
     let mut reach: Option<[f64; 2]> = None;
-    for c in clusters([pieces.as_slice()]) {
+    for c in clusters([pieces.as_slice()]).filter(|c| c.script == ShapedScript::Thai) {
         for (id, [_, dy]) in &c.glyphs {
             let g = shaped_glyph(c.script, *id).ok()?;
             if !g.contours.is_empty() {
@@ -414,44 +436,24 @@ pub fn thai_reach(line: &str) -> Option<[f64; 2]> {
     reach
 }
 
-/// The first character of `s` a text box's appearance ([`appearance_lines`]) would draw as `?`:
-/// one the standard fonts (WinAnsiEncoding) can't draw that is neither Thai nor Korean or Japanese
-/// a craft-fonts face has ([`cjk_fallback`]), or Thai on a line the Thai face can't draw (this
-/// build has none, or it lacks a character). Line breaks don't count.
+/// The first character of `s` a generated appearance would draw as `?`: one the standard fonts
+/// (WinAnsiEncoding) can't draw and that isn't Thai, or Thai on a line the Thai face can't draw
+/// (this build has none, or it lacks a character). Line breaks don't count.
 pub fn first_undrawable(s: &str) -> Option<char> {
-    s.split(['\n', '\r']).find_map(|line| undrawable_in_line(line, true))
+    s.split(['\n', '\r']).find_map(first_undrawable_in_line)
 }
 
-/// The first character of one line that headers, footers and watermarks would draw as `?`. They
-/// draw Thai from the Thai face and everything else in a standard font, so Korean and Japanese
-/// count here. A line break in the line counts too.
+/// [`first_undrawable`] for one line drawn as it is: a line break in it counts.
 pub fn first_undrawable_in_line(line: &str) -> Option<char> {
-    undrawable_in_line(line, false)
-}
-
-fn undrawable_in_line(line: &str, draws_cjk: bool) -> Option<char> {
-    // A text box's appearance leaves nothing as `?` where the last resort draws: what no face
-    // has, and Thai its face can't shape, come out of [`fallback_pieces`] drawn.
-    if draws_cjk && crate::last_resort::draws() {
-        return None;
-    }
-    let thai_fails = line.chars().any(is_thai) && thai_pieces(line).is_err();
-    line.chars().find(|c| {
-        if is_thai(*c) {
-            thai_fails
-        } else if draws_cjk && cjk_fallback(*c) {
-            false
-        } else {
-            !crate::win_ansi_encodable(*c)
-        }
-    })
+    let shaped_fails = line.chars().any(needs_shaping) && thai_pieces(line).is_err();
+    line.chars().find(|c| if needs_shaping(*c) { shaped_fails } else { !crate::win_ansi_encodable(*c) })
 }
 
 /// Why the Thai in `text` can't be drawn ([`thai_message`]): this build has no Thai face, or the
 /// face lacks a character. For tools that refuse such text rather than write `?`; `None` when all
 /// of its Thai draws, or it has none.
 pub fn thai_refusal(text: &str) -> Option<String> {
-    text.split(['\n', '\r']).filter(|l| l.chars().any(is_thai)).find_map(|l| thai_pieces(l).err().map(|e| thai_message(e, l)))
+    text.split(['\n', '\r']).filter(|l| l.chars().any(needs_shaping)).find_map(|l| thai_pieces(l).err().map(|e| shaped_message(e, l)))
 }
 
 /// [`type3_font`] written into `doc`, with its glyphs, descriptor and ToUnicode as objects of their
@@ -653,37 +655,6 @@ mod tests {
         assert_eq!((stored, fonts.iter().count()), (0, 0));
     }
 
-    /// Korean and Japanese in a text box or a form field are shaped with their craft-fonts faces
-    /// when asked for, beside the standard font that draws the rest; headers, footers and
-    /// watermarks, which don't draw them, still report them.
-    #[test]
-    fn korean_and_japanese_are_shaped_with_their_faces_when_asked_for() {
-        let line = "Name: 홍길동 テスト";
-        // Not asked for: one piece for the standard font, whatever the build has.
-        assert_eq!(fallback_pieces(line, false, false, false).unwrap(), [Piece::Latin(line.into())]);
-        assert_eq!(first_undrawable_in_line(line), Some('홍'));
-        if !line.chars().filter(|c| !c.is_ascii()).all(cjk_fallback) {
-            eprintln!("built without Korean and Japanese craft-fonts faces (CRAFT_FONTS_DIR unset): nothing more to check");
-            assert_eq!(first_undrawable(line), Some('홍'));
-            return;
-        }
-        assert!(!cjk_fallback('a') && !cjk_fallback('\n') && !cjk_fallback('ก'));
-        let pieces = fallback_pieces(line, false, false, true).unwrap();
-        let kinds: Vec<&str> = pieces.iter().map(|p| if matches!(p, Piece::Latin(_)) { "standard" } else { "shaped" }).collect();
-        assert_eq!(kinds, ["standard", "shaped", "standard", "shaped"]);
-        let shown: String = clusters([pieces.as_slice()]).map(|c| c.text.as_str()).collect();
-        assert_eq!(shown, "홍길동テスト");
-        // Full-width glyphs are about one em each; the stand-in measure gives a tenth of that.
-        let narrow = |s: &str, size: f64| s.chars().count() as f64 * size * 0.1;
-        assert!(fallback_width("홍길동", 10.0, false, false, true, narrow) > 20.0);
-        assert_eq!(fallback_width("홍길동", 10.0, false, false, false, narrow), 3.0);
-        assert_eq!(first_undrawable(line), None);
-        let mut fonts = Dict::new();
-        let (lines, _) = fallback_appearance_lines(&[line.to_string()], false, false, true, &mut fonts);
-        assert_eq!(lines.len(), 1);
-        assert!(fonts.iter().count() > 0 && fonts.iter().all(|(name, _)| name.starts_with(b"PCCj")), "the Type 3 fonts are named PCCj…");
-    }
-
     /// #6822: Greek, and the Latin and Cyrillic letters WinAnsiEncoding lacks, are shaped with the
     /// bundled Inter face, which every build has; what WinAnsi holds stays the standard font's.
     #[test]
@@ -691,10 +662,10 @@ mod tests {
         assert!(latin_fallback('Γ') && latin_fallback('ř') && latin_fallback('ж'));
         assert!(!latin_fallback('é') && !latin_fallback('a') && !latin_fallback('\n') && !latin_fallback('北') && !latin_fallback('ก'));
         // Text WinAnsi holds is one piece for the standard font, measured by it.
-        assert_eq!(fallback_pieces("Café (±)", false, true, false).unwrap(), [Piece::Latin("Café (±)".into())]);
-        assert_eq!(fallback_width("Café", 10.0, false, true, false, |s, size| s.chars().count() as f64 * size), 40.0);
+        assert_eq!(fallback_pieces("Café (±)", false, true).unwrap(), [Piece::Latin("Café (±)".into())]);
+        assert_eq!(fallback_width("Café", 10.0, false, true, |s, size| s.chars().count() as f64 * size), 40.0);
         // Greek words, with the standard font's space between them.
-        let pieces = fallback_pieces("Γειά σου", false, true, false).unwrap();
+        let pieces = fallback_pieces("Γειά σου", false, true).unwrap();
         assert!(
             matches!(&pieces[..], [Piece::Shaped(a), Piece::Latin(sp), Piece::Shaped(b)] if sp == " " && a.len() == 4 && b.len() == 3),
             "{pieces:?}"
@@ -702,24 +673,47 @@ mod tests {
         let text: String = clusters([pieces.as_slice()]).map(|c| c.text.as_str()).collect();
         assert_eq!(text, "Γειάσου", "each character copies once");
         assert!(clusters([pieces.as_slice()]).all(|c| c.script == ShapedScript::Latin && c.advance > 0.0));
-        assert!(fallback_width("Γειά", 10.0, false, true, false, |_, _| 0.0) > 0.0);
+        assert!(fallback_width("Γειά", 10.0, false, true, |_, _| 0.0) > 0.0);
         // Mixed: the Latin stays the standard font's.
-        let mixed = fallback_pieces("Name: Γειά ok", false, true, false).unwrap();
+        let mixed = fallback_pieces("Name: Γειά ok", false, true).unwrap();
         assert!(matches!(&mixed[..], [Piece::Latin(a), Piece::Shaped(_), Piece::Latin(b)] if a == "Name: " && b == " ok"), "{mixed:?}");
         // A combining accent the standard font lacks takes its letter with it.
-        let accent = fallback_pieces("Cafe\u{301}!", false, true, false).unwrap();
+        let accent = fallback_pieces("Cafe\u{301}!", false, true).unwrap();
         assert!(
             matches!(&accent[..], [Piece::Latin(a), Piece::Shaped(c), Piece::Latin(b)] if a == "Caf" && b == "!" && c.iter().map(|c| c.text.as_str()).collect::<String>() == "e\u{301}"),
             "{accent:?}"
         );
         // Without `latin`, nothing changes.
-        assert_eq!(fallback_pieces("Γειά", false, false, false).unwrap(), [Piece::Latin("Γειά".into())]);
+        assert_eq!(fallback_pieces("Γειά", false, false).unwrap(), [Piece::Latin("Γειά".into())]);
         // The fonts are built under PCLa names, and a character no face here has stays `?`.
         let mut fonts = Dict::new();
-        let (lines, shaped) = fallback_appearance_lines(&["Γειά 北".to_string()], false, true, false, &mut fonts);
+        let (lines, shaped) = fallback_appearance_lines(&["Γειά ሰ".to_string()], false, true, &mut fonts);
         assert!(fonts.iter().any(|(k, _)| k.starts_with(b"PCLa")));
-        assert!(matches!(&lines[0][..], [Piece::Shaped(c), Piece::Latin(rest)] if shaped.code(&c[0]).is_some() && rest == " 北"), "{lines:?}");
-        assert_eq!(first_undrawable_in_line(" 北"), Some('北'));
+        assert!(matches!(&lines[0][..], [Piece::Shaped(c), Piece::Latin(rest)] if shaped.code(&c[0]).is_some() && rest == " ሰ"), "{lines:?}");
+        assert_eq!(first_undrawable_in_line(" ሰ"), Some('ሰ'));
+    }
+
+    #[test]
+    fn korean_and_japanese_the_standard_fonts_lack_are_shaped_with_their_faces() {
+        assert_eq!((cjk_fallback('a'), cjk_fallback('é'), cjk_fallback('\n'), cjk_fallback('ሰ')), (None, None, None, None));
+        if !crate::korean_has('한') {
+            assert_eq!(cjk_fallback('한'), None);
+            assert_eq!(first_undrawable("이름: Kim"), Some('이'), "without the face, Hangul is undrawable");
+            return;
+        }
+        assert_eq!(cjk_fallback('한'), Some(ShapedScript::Korean { serif: false }));
+        let pieces = thai_pieces("이름: Kim").unwrap();
+        assert!(
+            matches!(&pieces[..], [Piece::Shaped(k), Piece::Latin(rest)] if k.iter().all(|c| c.script == ShapedScript::Korean { serif: false }) && rest == ": Kim"),
+            "{pieces:?}"
+        );
+        let text: String = clusters([pieces.as_slice()]).map(|c| c.text.as_str()).collect();
+        assert_eq!(text, "이름", "each character copies once");
+        assert_eq!((first_undrawable("이름: Kim"), thai_refusal("이름: Kim")), (None, None));
+        assert!(thai_width("이름", 10.0, |_, _| 0.0) > 0.0);
+        if crate::japanese_has('あ') {
+            assert_eq!(cjk_fallback('あ'), Some(ShapedScript::Japanese { serif: false }));
+        }
     }
 
     #[test]
@@ -736,7 +730,7 @@ mod tests {
             return;
         }
         assert_eq!((first_undrawable("ชื่อ: น้ำ\nOK"), thai_refusal("ชื่อ: น้ำ")), (None, None));
-        assert_eq!(first_undrawable("น้ำ ☃"), Some('☃'));
+        assert_eq!(first_undrawable("น้ำ ሰ"), Some('ሰ'));
         // Stacked marks reach above the em box's 0.9, a descender below its 0.3.
         let [_, top] = thai_reach("น้ำ").unwrap();
         let [bottom, _] = thai_reach("ฎู").unwrap();
@@ -756,18 +750,19 @@ mod tests {
         let unassigned = '\u{0378}';
         let line = format!("Ab \u{0540}{unassigned} c");
         if !crate::embedding::accepts_any_document_font() {
-            assert!(matches!(&fallback_pieces(&line, false, true, true).unwrap()[..], [Piece::Latin(all)] if *all == line));
+            assert!(matches!(&fallback_pieces(&line, false, true).unwrap()[..], [Piece::Latin(all)] if *all == line));
             assert_eq!(first_undrawable(&line), Some('\u{0540}'));
         }
         crate::last_resort::DRAWS.with(|draws| draws.set(true));
-        let pieces = fallback_pieces(&line, false, true, true).unwrap();
+        let pieces = fallback_pieces(&line, false, true).unwrap();
         assert!(matches!(&pieces[..], [Piece::Latin(a), Piece::Shaped(drawn), Piece::Latin(b)] if a == "Ab " && b == " c" && drawn.len() == 2));
         assert!(clusters([pieces.as_slice()]).all(|c| c.script == ShapedScript::LastResort));
         assert_eq!(first_undrawable(&line), None);
-        assert!(fallback_width(&unassigned.to_string(), 10.0, false, true, true, |_, _| 0.0) > 0.0, "the box has its own width");
+        assert_eq!(thai_refusal(&line), None, "nothing is refused either");
+        assert!(fallback_width(&unassigned.to_string(), 10.0, false, true, |_, _| 0.0) > 0.0, "the box has its own width");
         // The outlines are made, so the fonts for them are built without a face.
         let mut fonts = Dict::new();
-        let (_, shaped) = fallback_appearance_lines(&[line], false, true, true, &mut fonts);
+        let (_, shaped) = fallback_appearance_lines(&[line], false, true, &mut fonts);
         assert!(clusters([pieces.as_slice()]).all(|c| shaped.code(c).is_some()));
         crate::last_resort::DRAWS.with(|draws| draws.set(false));
     }

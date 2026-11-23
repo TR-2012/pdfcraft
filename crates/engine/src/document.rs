@@ -101,6 +101,9 @@ pub enum EditNotice {
     /// said the file conforms to PDF/A or PDF/UA: each claim was written back in a packet of its
     /// own, or lost (see [`RedactionIdentification`](crate::RedactionIdentification)).
     RedactionIdentification(pdfcraft_redact::Identification),
+    /// A text edit set some characters in `face`, a stand-in, because the text's own font has
+    /// no glyph for them. The edit was made; this says which face drew those characters.
+    FontSubstituted { face: String },
 }
 
 /// The standards whose identification `id` has as `claim`: "PDF/A", "PDF/UA" or both, joined.
@@ -122,6 +125,9 @@ impl std::fmt::Display for EditNotice {
                 )
             }
             EditNotice::RedactionElsewhere(e) => elsewhere_text(e, f),
+            EditNotice::FontSubstituted { face } => {
+                write!(f, "the text's font has no glyphs for some of these characters, so they were set in {face}")
+            }
             EditNotice::RedactionIdentification(id) => {
                 use pdfcraft_redact::Claim;
                 write!(f, "the document's XMP metadata held the redacted text and was removed")?;

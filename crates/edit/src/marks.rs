@@ -1,4 +1,4 @@
-use pdfcraft_fonts::shaped_text::{Piece, ShapedFonts, clusters, first_undrawable_in_line, is_thai, thai_message, thai_pieces};
+use pdfcraft_fonts::shaped_text::{Piece, ShapedFonts, clusters, first_undrawable_in_line, needs_shaping, shaped_message, thai_pieces};
 
 use super::{Dict, Document, EditError, Object, Rgb, added};
 
@@ -22,8 +22,8 @@ impl MarkText {
         pages: &[usize],
         lines: impl IntoIterator<Item = &'a str>,
     ) -> Result<Self, EditError> {
-        let thai = |line: &str| thai_pieces(line).map_err(|e| EditError::Invalid(thai_message(e, line)));
-        let pieces = lines.into_iter().filter(|l| l.chars().any(is_thai)).map(thai).collect::<Result<Vec<_>, _>>()?;
+        let thai = |line: &str| thai_pieces(line).map_err(|e| EditError::Invalid(shaped_message(e, line)));
+        let pieces = lines.into_iter().filter(|l| l.chars().any(needs_shaping)).map(thai).collect::<Result<Vec<_>, _>>()?;
         if pieces.is_empty() {
             return Ok(Self::default());
         }
@@ -38,7 +38,7 @@ impl MarkText {
             ShapedFonts::new(clusters(pieces.iter().map(Vec::as_slice)), pdfcraft_fonts::shaped_glyph, &taken, &mut fonts, "PCTh", &mut |o| {
                 Object::Ref(doc.add(o))
             })
-            .map_err(|(e, c)| EditError::Invalid(thai_message(e, &c.text)))?;
+            .map_err(|(e, c)| EditError::Invalid(shaped_message(e, &c.text)))?;
         Ok(Self { shaped, fonts })
     }
 
@@ -58,7 +58,7 @@ impl MarkText {
     ) {
         let plain = || vec![Piece::Latin(line.into())];
         // `new` shaped every line drawn, so this shapes.
-        let pieces = if self.fonts.is_empty() || !line.chars().any(is_thai) { plain() } else { thai_pieces(line).unwrap_or_else(|_| plain()) };
+        let pieces = if self.fonts.is_empty() || !line.chars().any(needs_shaping) { plain() } else { thai_pieces(line).unwrap_or_else(|_| plain()) };
         self.shaped.show_line(out, &pieces, x, y, size, latin, pdfcraft_fonts::win_ansi, width, current);
     }
 

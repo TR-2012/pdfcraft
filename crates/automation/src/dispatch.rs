@@ -640,6 +640,7 @@ impl Automation {
                     char_spacing: a.opt_num("char_spacing")?,
                     scale: a.opt_num("scale")?,
                     width,
+                    keep_fonts: a.opt_bool("keep_fonts")?.unwrap_or(false),
                     ..Default::default()
                 };
                 let (dx, dy) = (a.opt_num("dx")?, a.opt_num("dy")?);

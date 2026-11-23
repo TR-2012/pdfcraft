@@ -142,6 +142,7 @@ pub(super) fn draw(doc: &mut Document, c: &Content, view: [f64; 6], taken: &Dict
             let face_or_new =
                 |has: fn(char) -> bool, face: bool| t.text.chars().any(has) && (face || !existing || crate::text::draws_undrawable_characters());
             if t.text.chars().any(is_thai)
+                || t.text.chars().any(|c| pdfcraft_fonts::cjk_fallback(c).is_some())
                 || face_or_new(is_arabic, pdfcraft_fonts::document_arabic_font().is_some())
                 || face_or_new(is_hebrew, pdfcraft_fonts::document_hebrew_font(false).is_some())
                 || has_cjk(t)
