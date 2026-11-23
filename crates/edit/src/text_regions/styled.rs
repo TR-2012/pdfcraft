@@ -1,4 +1,5 @@
 use super::super::interp::TextState;
+use super::super::undrawable::{draws_undrawable_characters, installed_glyph, placeholder_glyph};
 use super::grouping::{across, is_centred, row_rect};
 use super::{
     BlockStyle, CraftFont, Dict, Document, EditError, HashMap, LineEdit, MAX_TYPE3_GLYPHS, Matrix, Metrics, Object, Op, PdfString, Pieces,
@@ -33,6 +34,9 @@ struct FontResolver<'a> {
     metrics: &'a mut std::collections::BTreeMap<String, Metrics>,
     full_faces: HashMap<String, String>,
     programs: HashMap<String, Option<std::sync::Arc<Vec<u8>>>>,
+    /// The standard fonts that may stand in for a source font, by resource name, measured once
+    /// each. One is added to the page only when it shows a character ([`Self::substitute_for`]).
+    substitutes: HashMap<String, Metrics>,
 }
 
 impl FontResolver<'_> {
@@ -101,7 +105,11 @@ impl FontResolver<'_> {
         Ok(name)
     }
 
-    fn substitute_font(&mut self, source: &TextLine) -> String {
+    /// The standard font that stands in for `source`, added to the page, when it shows `text`.
+    /// `None` for the few WinAnsi characters a standard font has no code for (the tab, the
+    /// no-break space, the soft hyphen): they go on to the fallback faces instead of failing
+    /// later, when the row is written.
+    fn substitute_for(&mut self, source: &TextLine, text: &str) -> Option<String> {
         let family = source_family(&source.base_font);
         let base = family.base_font(source.bold, source.italic);
         let name = format!("PCEd{}", base.replace('-', ""));
@@ -110,9 +118,13 @@ impl FontResolver<'_> {
         font.set(b"Subtype".to_vec(), Object::name("Type1"));
         font.set(b"BaseFont".to_vec(), Object::name(base));
         font.set(b"Encoding".to_vec(), Object::name("WinAnsiEncoding"));
-        self.metrics.entry(name.clone()).or_insert_with(|| Metrics::from_dict(self.doc, &font));
+        let measured = self.substitutes.entry(name.clone()).or_insert_with(|| Metrics::from_dict(self.doc, &font));
+        if !source_encodes(measured, text) {
+            return None;
+        }
+        self.metrics.entry(name.clone()).or_insert_with(|| measured.clone());
         self.fonts.set(name.clone().into_bytes(), Object::Dict(font));
-        name
+        Some(name)
     }
 }
 
@@ -183,7 +195,7 @@ impl CharacterPreparation<'_> {
         let mut chars = Vec::new();
         let mut substituted = None;
         let mut fallback = FallbackBuilder::new(max_glyphs);
-        let mut resolver = FontResolver { doc, fonts, metrics, full_faces: HashMap::new(), programs: HashMap::new() };
+        let mut resolver = FontResolver { doc, fonts, metrics, full_faces: HashMap::new(), programs: HashMap::new(), substitutes: HashMap::new() };
         for (range, index) in spans {
             let source = lines.get(index).unwrap_or(first);
             let span = draft.get(range.clone()).unwrap_or_default();
@@ -284,15 +296,19 @@ impl CharacterPreparation<'_> {
                     name.clone()
                 } else if let Some(name) = resolver.encodable_font(source, &text, requested)? {
                     name
-                } else if needs_type3(&text) {
-                    match fallback.prepare(source, ch, &text, chars.len()) {
-                        Ok(name) => name,
-                        Err(refusal) => resolver.any_page_font(&text).ok_or(refusal)?,
-                    }
-                } else {
-                    let name = resolver.substitute_font(source);
+                } else if !needs_type3(&text)
+                    && let Some(name) = resolver.substitute_for(source, &text)
+                {
                     substituted = Some(source_family(&source.base_font).base_font(source.bold, source.italic).to_owned());
                     name
+                } else {
+                    match fallback.prepare(source, ch, &text, chars.len()) {
+                        Ok(name) => name,
+                        Err(refusal) => match resolver.any_page_font(&text) {
+                            Some(name) => name,
+                            None => fallback.prepare_undrawable(source, ch, chars.len(), refusal)?,
+                        },
+                    }
                 };
                 chars.push((ch, index, name));
             }
@@ -338,30 +354,82 @@ impl FallbackBuilder {
         } else {
             let (faces, _) = type3_faces(text, source_family(&source.base_font), source.bold)?;
             let face = fallback_face(&faces, &[ch], |face, ch| japanese_glyph_from(face, ch).is_ok()).ok_or_else(|| no_fallback_font(text))?;
-            let index = self.groups.iter().position(|group| std::ptr::eq(group.face, face)).unwrap_or_else(|| {
-                let index = self.groups.len();
-                self.groups.push(FallbackGroup { face, seen: Default::default(), glyphs: Vec::new(), positions: Vec::new() });
-                index
-            });
+            let index = self.group_of(face);
             self.names.insert(key, index);
             index
         };
-        let group = self.groups.get_mut(group_index).ok_or_else(|| EditError::Invalid("the fallback face is missing".into()))?;
-        if !group.seen.contains(&ch) {
+        let group = self.groups.get(group_index).ok_or_else(|| EditError::Invalid("the fallback face is missing".into()))?;
+        let (face, already_drawn) = (group.face, group.seen.contains(&ch));
+        if !already_drawn {
             if self.glyphs >= self.budget {
                 return Err(EditError::Invalid(format!(
                     "the replacement needs more than {} fallback glyphs; edit a smaller paragraph or load a complete font",
                     self.budget
                 )));
             }
-            let (path, width) = type3_glyph(group.face, ch)?.ok_or_else(|| no_glyph_for(group.face, ch))?;
-            let code = u8::try_from((group.glyphs.len() % self.per_font).saturating_add(1))
-                .map_err(|_| EditError::Invalid("replacement text has too many unique characters".into()))?;
-            group.glyphs.push(Type3Glyph { code, ch, path, width });
-            // Only now: a character the face could not draw is not remembered as drawn.
-            group.seen.insert(ch);
-            self.glyphs = self.glyphs.saturating_add(1);
+            let (path, width) = type3_glyph(face, ch)?.ok_or_else(|| no_glyph_for(face, ch))?;
+            self.add_glyph(group_index, ch, path, width)?;
         }
+        self.show_at(group_index, position)
+    }
+
+    /// Draws `ch` although no fallback face and no font of the page has it, where the build does
+    /// that ([`draws_undrawable_characters`]): with the outline of an installed face, else as a
+    /// placeholder in a fallback font the edit writes anyway. Otherwise `refusal` stands.
+    fn prepare_undrawable(&mut self, source: &TextLine, ch: char, position: usize, refusal: EditError) -> Result<String, EditError> {
+        if !draws_undrawable_characters() || self.glyphs >= self.budget {
+            return Err(refusal);
+        }
+        let (face, path, width) = match installed_glyph(ch) {
+            Some(drawn) => drawn,
+            None => {
+                let Some(face) = self.placeholder_face(source) else { return Err(refusal) };
+                let (path, width) = placeholder_glyph(ch);
+                (face, path, width)
+            }
+        };
+        let group_index = self.group_of(face);
+        // The face first asked for the character did not have it: later ones go straight here.
+        self.names.insert((source.base_font.clone(), source.bold, ch), group_index);
+        if !self.groups.get(group_index).is_some_and(|group| group.seen.contains(&ch)) {
+            self.add_glyph(group_index, ch, path, width)?;
+        }
+        self.show_at(group_index, position)
+    }
+
+    /// The face whose generated font holds a placeholder: one the edit already draws with, else
+    /// the first fallback face for `source` (the bundled Latin face is always among them).
+    fn placeholder_face(&self, source: &TextLine) -> Option<&'static CraftFont> {
+        if let Some(group) = self.groups.first() {
+            return Some(group.face);
+        }
+        let (faces, _) = type3_faces("", source_family(&source.base_font), source.bold).ok()?;
+        faces.first().copied()
+    }
+
+    /// The group that draws with `face`, added when this is its first character.
+    fn group_of(&mut self, face: &'static CraftFont) -> usize {
+        self.groups.iter().position(|group| std::ptr::eq(group.face, face)).unwrap_or_else(|| {
+            let index = self.groups.len();
+            self.groups.push(FallbackGroup { face, seen: Default::default(), glyphs: Vec::new(), positions: Vec::new() });
+            index
+        })
+    }
+
+    fn add_glyph(&mut self, group_index: usize, ch: char, path: Vec<u8>, width: f64) -> Result<(), EditError> {
+        let group = self.groups.get_mut(group_index).ok_or_else(|| EditError::Invalid("the fallback face is missing".into()))?;
+        let code = u8::try_from((group.glyphs.len() % self.per_font).saturating_add(1))
+            .map_err(|_| EditError::Invalid("replacement text has too many unique characters".into()))?;
+        group.glyphs.push(Type3Glyph { code, ch, path, width });
+        // Only now: a character the face could not draw is not remembered as drawn.
+        group.seen.insert(ch);
+        self.glyphs = self.glyphs.saturating_add(1);
+        Ok(())
+    }
+
+    /// Records that the character at `position` of the draft is shown by this group's font.
+    fn show_at(&mut self, group_index: usize, position: usize) -> Result<String, EditError> {
+        let group = self.groups.get_mut(group_index).ok_or_else(|| EditError::Invalid("the fallback face is missing".into()))?;
         group.positions.push(position);
         Ok(String::new())
     }
@@ -571,7 +639,10 @@ impl ShapedRunDrawing<'_> {
 fn validate_contextual_rows(rows: &[Vec<StyledChar>], kept: &[bool]) -> Result<(), EditError> {
     for (row, _) in rows.iter().zip(kept).filter(|(_, retained)| !**retained) {
         let text: String = row.iter().map(|character| character.0).collect();
+        // A build that draws what it has no glyph for writes such a row character by character,
+        // unshaped, rather than refusing it ([`shape_source`] does the same for one run).
         if pdfcraft_fonts::source_shaping::required(&text)
+            && !draws_undrawable_characters()
             && row.first().is_some_and(|first| row.iter().any(|character| character.1 != first.1 || character.2 != first.2))
         {
             return Err(EditError::Invalid(
@@ -1296,6 +1367,12 @@ fn shape_source(doc: &Document, fonts: &Dict, thai: &ThaiShaping, name: &str, te
         if let Some((bytes, shaped)) = shape_with_program(doc, &font, text) {
             return Ok(Some(ShapedText { run: shaped, font: ShapedFont::Program { bytes, family } }));
         }
+    }
+    // No program shapes the run. Its font holds every character of it (that is how they came to
+    // be in this font), so a build that draws what it cannot shape shows them one by one: marks
+    // sit where their own glyphs put them and letters keep their isolated forms.
+    if draws_undrawable_characters() {
+        return Ok(None);
     }
     if let Some(error) = in_place {
         return Err(error);

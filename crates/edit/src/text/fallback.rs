@@ -1,6 +1,7 @@
 use super::HashSet;
 use super::interp::{Shown, Ts};
 use super::lines::page_dict;
+use super::undrawable::{draws_undrawable_characters, installed_glyph, placeholder_glyph};
 use super::{
     CraftFont, Dict, Document, EditError, GlyphError, HashMap, Metrics, Object, Op, PdfString, Stream, TextLine, japanese_glyph_from, parse,
 };
@@ -429,12 +430,18 @@ pub(crate) fn type3_faces(text: &str, family: crate::added::Family, bold: bool) 
         return Ok((korean.into_iter().chain(japanese).chain(latin).collect(), false));
     }
     // Points are drawn on their letter with the font's positioning, which a one-glyph-per-
-    // character Type 3 font can't do; refuse rather than print them beside the letter.
-    if text.chars().any(crate::bidi::is_hebrew_mark) {
+    // character Type 3 font can't do; refuse rather than print them beside the letter. A build
+    // that draws what it has no glyph for keeps them in the text, placed as their face draws them.
+    if text.chars().any(crate::bidi::is_hebrew_mark) && !draws_undrawable_characters() {
         return Err(EditError::Invalid("Hebrew points (niqqud) can't be written into a PDF yet; type the text without them".into()));
     }
-    let hebrew = pdfcraft_fonts::document_hebrew_font(bold).ok_or_else(no_hebrew_font)?;
-    Ok((std::iter::once(hebrew).chain(korean).chain(japanese).chain(latin).collect(), true))
+    // Without a Hebrew face the other faces stand first, and each letter comes from the last
+    // resort of a build that draws what it has no glyph for; every other build refuses here.
+    let hebrew = pdfcraft_fonts::document_hebrew_font(bold);
+    if hebrew.is_none() && !draws_undrawable_characters() {
+        return Err(no_hebrew_font());
+    }
+    Ok((hebrew.into_iter().chain(korean).chain(japanese).chain(latin).collect(), true))
 }
 
 pub(super) fn type3_font(
@@ -492,12 +499,22 @@ pub(super) fn type3_font(
             }
             drawn
         };
-        let Some((path, width)) = drawn else { return Err(no_glyph_for(face, ch)) };
+        let Some((path, width)) = drawn.or_else(|| last_resort_glyph(ch)) else { return Err(no_glyph_for(face, ch)) };
         let code = u8::try_from((i % per_font).saturating_add(1))
             .map_err(|_| EditError::Invalid("replacement text has too many unique characters".into()))?;
         glyphs.push(Type3Glyph { code, ch, path, width });
     }
     Ok(write_type3_glyphs(doc, fonts_res, face, hebrew, glyphs, per_font))
+}
+
+/// What draws `ch` when no fallback face has it, in a build that draws such a character
+/// ([`draws_undrawable_characters`]): an installed face's outline, else a placeholder. The
+/// generated font is a set of glyph procedures, so one from another face sits in it like the rest.
+fn last_resort_glyph(ch: char) -> Option<(Vec<u8>, f64)> {
+    if !draws_undrawable_characters() {
+        return None;
+    }
+    Some(installed_glyph(ch).map_or_else(|| placeholder_glyph(ch), |(_, path, width)| (path, width)))
 }
 
 /// Write already validated outlines; callers can prepare every face before adding any objects.

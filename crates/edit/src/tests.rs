@@ -9618,6 +9618,83 @@ fn a_character_no_fallback_face_has_is_taken_from_a_font_on_the_page() {
     assert_eq!(text::text_blocks(&reopen(&doc), 0).unwrap()[0].editor_text, typed);
 }
 
+/// Edits as a build that accepts any document font does, until dropped: a character nothing has
+/// a glyph for is drawn (from an installed face in such a build, else as a placeholder).
+struct DrawsUndrawable;
+
+impl DrawsUndrawable {
+    fn on() -> Self {
+        text::DRAWS_UNDRAWABLE.with(|draws| draws.set(true));
+        Self
+    }
+}
+
+impl Drop for DrawsUndrawable {
+    fn drop(&mut self) {
+        text::DRAWS_UNDRAWABLE.with(|draws| draws.set(false));
+    }
+}
+
+/// U+0378 is unassigned, so no bundled, page or installed font has a glyph for it.
+const UNASSIGNED: char = '\u{0378}';
+
+/// A character no font has is refused, except in a build that draws a box for it: there the edit
+/// goes through and the character stays in the text. One row takes the single-style rewrite, a
+/// line break the styled one.
+#[test]
+fn a_character_no_font_has_is_refused_unless_the_build_draws_a_box_for_it() {
+    for typed in [format!("Stable {UNASSIGNED} text"), format!("Stable\n{UNASSIGNED} text")] {
+        let edit = |doc: &mut Document| text::rewrite_block(doc, 0, 0, Some(&typed), &text::BlockStyle::default());
+        if !pdfcraft_fonts::embedding::accepts_any_document_font() {
+            let mut refused = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+            assert!(edit(&mut refused).is_err(), "{typed:?} is refused where nothing draws it");
+        }
+        let _draws = DrawsUndrawable::on();
+        let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+        edit(&mut doc).unwrap();
+        let read_back: String = text::text_blocks(&reopen(&doc), 0).unwrap().iter().map(|block| block.editor_text.clone()).collect();
+        assert!(read_back.contains(UNASSIGNED), "the character stays in the text: {read_back:?}");
+    }
+}
+
+/// A tab, a zero-width space and a control character have no glyph in any font. In a build that
+/// draws what it has no glyph for they take up their room (or none) instead of failing the edit,
+/// and the letters around them are all still there.
+#[test]
+fn a_tab_and_characters_that_are_never_seen_do_not_refuse_an_edit() {
+    let typed = "A\tB\u{200B}C\u{0007}D\nE";
+    let _draws = DrawsUndrawable::on();
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+    text::rewrite_block(&mut doc, 0, 0, Some(typed), &text::BlockStyle::default()).unwrap();
+    let letters: String =
+        text::text_blocks(&reopen(&doc), 0).unwrap().iter().flat_map(|block| block.editor_text.chars()).filter(char::is_ascii_alphabetic).collect();
+    assert_eq!(letters, "ABCDE");
+}
+
+/// A no-break space is in WinAnsi, but the standard font that stands in for the paragraph's font
+/// has no code for it. It takes a fallback glyph instead of failing when the row is written.
+#[test]
+fn a_no_break_space_the_standard_fonts_lack_takes_a_fallback_glyph() {
+    let typed = "Ten\u{00A0}pounds\nsterling";
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+    text::rewrite_block(&mut doc, 0, 0, Some(typed), &text::BlockStyle::default()).unwrap();
+    let read_back: String = text::text_blocks(&reopen(&doc), 0).unwrap().iter().map(|block| block.editor_text.clone()).collect();
+    assert!(read_back.contains("Ten") && read_back.contains("pounds") && read_back.contains("sterling"), "{read_back:?}");
+}
+
+/// Text that needs shaping (here Thai with a tone mark and a vowel sign) in a paragraph whose font
+/// cannot shape it is refused, except in a build that draws what it has no glyph for: there each
+/// character is written on its own, unshaped.
+#[test]
+fn text_no_font_can_shape_is_written_unshaped_where_the_build_draws_it() {
+    let typed = "Stable \u{0E19}\u{0E49}\u{0E33} text";
+    let _draws = DrawsUndrawable::on();
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+    text::rewrite_block(&mut doc, 0, 0, Some(typed), &text::BlockStyle::default()).unwrap();
+    let read_back: String = text::text_blocks(&reopen(&doc), 0).unwrap().iter().map(|block| block.editor_text.clone()).collect();
+    assert!(read_back.contains('\u{0E19}') && read_back.contains("Stable") && read_back.contains("text"), "{read_back:?}");
+}
+
 #[test]
 fn a_shaped_run_is_one_text_object_with_each_glyph_where_shaping_put_it() {
     let inter = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");

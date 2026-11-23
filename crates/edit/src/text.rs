@@ -36,6 +36,7 @@ pub mod forms;
 mod interp;
 mod lines;
 mod rewrite;
+mod undrawable;
 
 #[cfg(test)]
 use blocks::wrap;
@@ -71,6 +72,8 @@ use rewrite::{coincident_ops, rewrite_block_from};
 pub(crate) use rewrite::{paragraph_ops, reveal_ops, selectable_blocks, show_starts, translate_blocks};
 #[cfg(test)]
 pub(crate) use rewrite::{replace_line_with_limit, rewrite_block_with_limit};
+#[cfg(test)]
+pub(crate) use undrawable::DRAWS_UNDRAWABLE;
 
 /// One line of existing text.
 #[derive(Clone, Debug, PartialEq)]
