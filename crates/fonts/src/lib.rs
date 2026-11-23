@@ -14,6 +14,7 @@ pub mod embedding;
 mod encodings;
 pub mod fallback;
 pub mod installed;
+pub mod last_resort;
 pub mod pdf;
 pub mod plan;
 mod script;

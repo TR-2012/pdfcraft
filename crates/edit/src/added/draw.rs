@@ -72,6 +72,8 @@ pub(super) fn draw_laid_shaped(
             ShapedScript::Thai => thai_error(e, &c.text),
             ShapedScript::Latin => EditError::Invalid(pdfcraft_fonts::shaped_text::latin_message(e, &c.text)),
             ShapedScript::Korean { .. } | ShapedScript::Japanese { .. } => cjk_error(e, &c.text),
+            // Its outlines are made, not read from a face, so this is not reached.
+            ShapedScript::LastResort => EditError::Invalid(format!("\"{}\" can't be drawn", c.text)),
         })?;
     out.extend(format!("BT {}\n", t.fill_op()).bytes());
     if t.char_spacing != 0.0 {
@@ -135,7 +137,10 @@ pub(super) fn draw(doc: &mut Document, c: &Content, view: [f64; 6], taken: &Dict
             }
             let mut fonts = Dict::new();
             fonts.set(name.clone().into_bytes(), Object::Dict(font));
-            let face_or_new = |has: fn(char) -> bool, face: bool| t.text.chars().any(has) && (face || !existing);
+            // With the last resort, text of a script whose face the build lacks is laid out and
+            // drawn as shaped text too, whether the item is new or not.
+            let face_or_new =
+                |has: fn(char) -> bool, face: bool| t.text.chars().any(has) && (face || !existing || crate::text::draws_undrawable_characters());
             if t.text.chars().any(is_thai)
                 || face_or_new(is_arabic, pdfcraft_fonts::document_arabic_font().is_some())
                 || face_or_new(is_hebrew, pdfcraft_fonts::document_hebrew_font(false).is_some())

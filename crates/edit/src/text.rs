@@ -74,6 +74,7 @@ pub(crate) use rewrite::{paragraph_ops, reveal_ops, selectable_blocks, show_star
 pub(crate) use rewrite::{replace_line_with_limit, rewrite_block_with_limit};
 #[cfg(test)]
 pub(crate) use undrawable::DRAWS_UNDRAWABLE;
+pub(crate) use undrawable::draws_undrawable_characters;
 
 /// One line of existing text.
 #[derive(Clone, Debug, PartialEq)]

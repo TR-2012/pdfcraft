@@ -385,8 +385,10 @@ pub fn clear_block(doc: &mut Document, page: usize, block: usize) -> Result<(), 
     let shown = interpret(doc, &ops, &res, &mut HashMap::new(), &mut Carry::new(), None, None)?;
     let mut patches = HashMap::new();
     for s in shown.into_iter().filter(|s| drops.contains(&s.op)) {
+        // Text used as a clipping path stays in the preview: without its glyphs the artwork
+        // behind them would flood its whole rectangle under the editor (#3429).
         if s.state.render_mode >= 4 {
-            return Err(EditError::Invalid("text used as a clipping path cannot be previewed for editing".into()));
+            continue;
         }
         let denominator = s.state.size * s.state.scale;
         let adjustment = if denominator != 0.0 { -1000.0 * s.advance / denominator } else { 0.0 };

@@ -42,6 +42,9 @@ pub enum ShapedScript {
     Japanese {
         serif: bool,
     },
+    /// No face of the build: a character nothing has a glyph for, drawn by
+    /// [`crate::last_resort`]. Its glyph id is the character's code point.
+    LastResort,
 }
 
 impl ShapedScript {
@@ -53,6 +56,7 @@ impl ShapedScript {
             Self::Latin => crate::document_latin_fonts(false).into_iter().next(),
             Self::Korean { serif } => crate::document_korean_fonts_for_style(serif, false).into_iter().next(),
             Self::Japanese { serif } => crate::document_japanese_font_for_style(serif, false),
+            Self::LastResort => None,
         }
     }
 }
@@ -75,6 +79,8 @@ fn face(script: ShapedScript) -> Option<&'static (FontRef<'static>, ShaperData)>
         ShapedScript::Korean { serif: true } => &KOREAN_SERIF,
         ShapedScript::Japanese { serif: false } => &JAPANESE,
         ShapedScript::Japanese { serif: true } => &JAPANESE_SERIF,
+        // Drawn character by character from whatever has the glyph, not from one face.
+        ShapedScript::LastResort => return None,
     };
     cache
         .get_or_init(|| {
@@ -208,14 +214,19 @@ fn shape_script(text: &str, rtl: bool, kind: ShapedScript) -> Result<Vec<ShapedC
         },
         ShapedScript::Korean { .. } => script::HANGUL,
         ShapedScript::Japanese { .. } => script::HAN,
+        // It has no face, so `face` above already answered `NoFont`; nothing is shaped as it.
+        ShapedScript::LastResort => script::COMMON,
     });
     // Preserve the historical Arabic per-character mapping; Hebrew, Thai and Latin marks stay with
     // their base, as do the conjoining jamo of a Hangul syllable.
     buffer.set_cluster_level(match kind {
         ShapedScript::Arabic => BufferClusterLevel::Characters,
-        ShapedScript::Hebrew | ShapedScript::Thai | ShapedScript::Latin | ShapedScript::Korean { .. } | ShapedScript::Japanese { .. } => {
-            BufferClusterLevel::MonotoneGraphemes
-        }
+        ShapedScript::Hebrew
+        | ShapedScript::Thai
+        | ShapedScript::Latin
+        | ShapedScript::Korean { .. }
+        | ShapedScript::Japanese { .. }
+        | ShapedScript::LastResort => BufferClusterLevel::MonotoneGraphemes,
     });
     let shaped = shaper.shape(buffer, ShapeOptions::new());
     // Clusters are byte offsets into `text`; a cluster shows the characters up to the next one.
@@ -255,6 +266,9 @@ pub fn arabic_glyph(id: u32) -> Result<GlyphOutline, GlyphError> {
 
 /// A bounded outline from the same face that produced the shaped glyph id.
 pub fn shaped_glyph(script: ShapedScript, id: u32) -> Result<GlyphOutline, GlyphError> {
+    if script == ShapedScript::LastResort {
+        return char::from_u32(id).map(crate::last_resort::outline).ok_or(GlyphError::Missing);
+    }
     let (font, _) = face(script).ok_or(GlyphError::NoFont)?;
     glyph(font, id)
 }

@@ -185,7 +185,10 @@ fn validate(c: &Content) -> Result<(), EditError> {
             // Without the Arabic face, `draw` decides for the Arabic letters themselves (#403): a new
             // item is refused with what's missing, and one that already holds Arabic stays movable.
             // Everything else in it is drawn in the standard font, so it still has to fit.
-            let undrawable = if t.text.chars().any(shaped_arabic) && pdfcraft_fonts::document_arabic_font().is_none() {
+            // Where the build has the last resort, it draws what no face has: nothing is refused.
+            let undrawable = if crate::text::draws_undrawable_characters() {
+                None
+            } else if t.text.chars().any(shaped_arabic) && pdfcraft_fonts::document_arabic_font().is_none() {
                 t.text.split('\n').find_map(|line| {
                     line.chars()
                         .find(|c| !(shaped_arabic(*c) || is_thai(*c) && pdfcraft_fonts::thai_has(*c) || pdfcraft_fonts::win_ansi_encodable(*c)))

@@ -163,6 +163,10 @@ struct ThaiShaping {
     /// Draft-only names whose rows, Latin ones included, are shaped and embedded with the
     /// complete program of this same-face resource: a span its subsets can't show in place.
     program: HashMap<String, String>,
+    /// The edit's rows are put in drawing order and drawn character by character
+    /// ([`rows_in_drawing_order`]), so their right-to-left runs are not shaped as well: a shaper
+    /// would turn them round a second time.
+    rows_in_drawing_order: bool,
 }
 
 /// How a Thai span keeps its source face ([`legacy_thai_font`]).
@@ -634,6 +638,37 @@ impl ShapedRunDrawing<'_> {
         block_ops.push(Op::new("EMC", vec![]));
         Ok(shaped.advance * size + extra)
     }
+}
+
+/// Whether the edit's rows are put in drawing order and drawn character by character, rather
+/// than each run shaped where it stands: for Hebrew, whose letters don't join (the single-style
+/// path writes it the same way), and, where the build draws what it can't shape, for other
+/// right-to-left text that no font program here shapes. Drawn in typing order, such a run would
+/// read backwards.
+fn rows_in_drawing_order(doc: &Document, fonts: &Dict, thai: &ThaiShaping, chars: &[StyledChar]) -> Result<bool, EditError> {
+    if chars.iter().any(|c| crate::bidi::is_hebrew(c.0)) {
+        return Ok(true);
+    }
+    if !draws_undrawable_characters() || !chars.iter().any(|c| crate::bidi::is_rtl(c.0)) {
+        return Ok(false);
+    }
+    let mut at = 0;
+    while let Some(item) = chars.get(at) {
+        let end = styled_run_end(chars, at);
+        let text: String = chars.get(at..end).unwrap_or_default().iter().map(|c| c.0).filter(|c| !matches!(c, '\n' | '\r')).collect();
+        if text.chars().any(crate::bidi::is_rtl) && shape_source(doc, fonts, thai, &item.2, &text)?.is_none() {
+            return Ok(true);
+        }
+        at = end;
+    }
+    Ok(false)
+}
+
+/// `row` in the order it is drawn, left to right ([`crate::bidi::visual_order`]), each character
+/// keeping its style and font.
+fn in_drawing_order(row: &[StyledChar]) -> Vec<StyledChar> {
+    let text: String = row.iter().map(|c| c.0).collect();
+    crate::bidi::visual_order(&text).into_iter().filter_map(|(index, drawn)| row.get(index).map(|c| (drawn, c.1, c.2.clone()))).collect()
 }
 
 fn validate_contextual_rows(rows: &[Vec<StyledChar>], kept: &[bool]) -> Result<(), EditError> {
@@ -1346,7 +1381,7 @@ fn shape_source(doc: &Document, fonts: &Dict, thai: &ThaiShaping, name: &str, te
             .ok_or_else(|| EditError::Invalid(format!("{family} cannot shape this text with its own layout; choose a font that covers it")))?;
         return Ok(Some(ShapedText { run: shaped, font: ShapedFont::Program { bytes, family } }));
     }
-    if !pdfcraft_fonts::source_shaping::required(text) {
+    if !pdfcraft_fonts::source_shaping::required(text) || (thai.rows_in_drawing_order && text.chars().any(crate::bidi::is_rtl)) {
         return Ok(None);
     }
     let source =
@@ -1506,6 +1541,75 @@ fn untouched_rows(block: &TextBlock, draft: &str, rows: &[std::ops::Range<usize>
             })
         })
         .collect()
+}
+
+/// How a justified row is stretched to the paragraph's width: the room added after each space
+/// that can take it. Word spacing (`Tw`) reaches only single-byte code 32, which a composite or
+/// generated font doesn't use, so the room is given by where the next word is placed instead.
+struct RowStretch {
+    /// The room after one such space, in user space.
+    gap: f64,
+    /// For each character of the row, whether it is a space that takes the room.
+    stretched: Vec<bool>,
+}
+
+impl RowStretch {
+    fn none() -> Self {
+        Self { gap: 0.0, stretched: Vec::new() }
+    }
+
+    /// The spaces between the row's first and last word take the room. Those before its first
+    /// word and after its last stay as they are, and so do those inside a run shaped as one piece.
+    fn of(
+        row: &[StyledChar],
+        row_index: usize,
+        shaped_runs: &ShapedRunCache,
+        char_advances: &HashMap<(usize, usize), Vec<f64>>,
+        row_width: f64,
+        available: f64,
+    ) -> Self {
+        let body_start = row.iter().position(|c| c.0 != ' ').unwrap_or(row.len());
+        let body_end = row.iter().rposition(|c| c.0 != ' ').map_or(0, |last| last.saturating_add(1));
+        let mut stretched = vec![false; row.len()];
+        let mut trailing_width = 0.0;
+        let mut pos = 0;
+        while pos < row.len() {
+            let end = styled_run_end(row, pos);
+            let widths = char_advances.get(&(row_index, pos)).map(Vec::as_slice).unwrap_or(&[]);
+            let takes_room = !shaped_runs.contains_key(&(row_index, pos));
+            for index in pos..end {
+                if index >= body_end {
+                    trailing_width += widths.get(index.saturating_sub(pos)).copied().unwrap_or(0.0);
+                } else if let Some(slot) = stretched.get_mut(index) {
+                    *slot = takes_room && index >= body_start && row.get(index).is_some_and(|c| c.0 == ' ');
+                }
+            }
+            pos = end;
+        }
+        let spaces = stretched.iter().filter(|space| **space).count();
+        let room = available - (row_width - trailing_width);
+        if spaces == 0 || !room.is_finite() || room <= 0.0 {
+            return Self::none();
+        }
+        Self { gap: room / spaces as f64, stretched }
+    }
+
+    /// Where the piece that starts at `pos` ends: with its run, or on a stretched row after the
+    /// spaces that follow its first word. A run shaped as one piece (`whole`) is never cut.
+    fn piece_end(&self, pos: usize, run_end: usize, whole: bool) -> usize {
+        if whole || self.gap <= 0.0 {
+            return run_end;
+        }
+        let is_stretched = |index: usize| self.stretched.get(index).copied().unwrap_or(false);
+        let last_space = (pos..run_end).find(|index| is_stretched(*index) && !is_stretched(index.saturating_add(1)));
+        last_space.map_or(run_end, |last| last.saturating_add(1).min(run_end))
+    }
+
+    /// The room that follows the characters `from..to`: one gap for each stretched space among them.
+    fn room(&self, from: usize, to: usize) -> f64 {
+        let spaces = self.stretched.get(from..to).unwrap_or_default().iter().filter(|space| **space).count();
+        self.gap * spaces as f64
+    }
 }
 
 fn segment_underline_runs(
@@ -1989,8 +2093,9 @@ pub(crate) fn rewrite_styled_block(
         max_glyphs,
     }
     .prepare()?;
-    let thai = prepared.thai;
+    let mut thai = prepared.thai;
     let chars = prepared.values;
+    thai.rows_in_drawing_order = rows_in_drawing_order(doc, &fonts, &thai, &chars)?;
     let substituted = prepared.substituted;
     let phrase_size = block.phrase_size();
     let size_of = |source: &TextLine, index: usize| {
@@ -2062,6 +2167,11 @@ pub(crate) fn rewrite_styled_block(
         Ok(width)
     };
     let (mut rows, row_ranges, row_lines, row_soft, row_gap, explicit) = wrap_styled_rows(&chars, width, measure)?;
+    if thai.rows_in_drawing_order {
+        for row in &mut rows {
+            *row = in_drawing_order(row);
+        }
+    }
     let space_styles: Vec<_> = rows.iter_mut().map(|row| assign_subset_space_fonts(row, &metrics)).collect();
     let streams = content_streams(doc, &p.dict)?;
     let pieces = crate::text::joined(&streams);
@@ -2090,7 +2200,10 @@ pub(crate) fn rewrite_styled_block(
     // What is in force where the rewrite is drawn, and what the text after it expects.
     let after = if split { &o.state } else { &o.bt_state };
     let at = if split { start } else { o.bt_op };
-    validate_contextual_rows(&rows, &kept)?;
+    // Rows in drawing order are drawn character by character: a row may mix fonts and styles.
+    if !thai.rows_in_drawing_order {
+        validate_contextual_rows(&rows, &kept)?;
+    }
     let measured: Vec<_> = rows.iter().map(|row| measure(row)).collect::<Result<_, _>>()?;
     let shaped = prepare_shaped_rows(doc, &fonts, &thai, &rows, &kept, advance)?;
     let ShapedRows { runs: shaped_runs, advances: segment_advances, char_advances } = shaped;
@@ -2161,11 +2274,22 @@ pub(crate) fn rewrite_styled_block(
                 crate::added::Align::Right => available - w,
                 _ => 0.0,
             };
+        // Justified: every row but the last fills the width, with the room left over after its spaces.
+        let justified = align == crate::added::Align::Justify && row_index.saturating_add(1) < rows.len();
+        let stretch = if justified { RowStretch::of(row, row_index, &shaped_runs, &char_advances, w, available) } else { RowStretch::none() };
         let mut pos = 0;
+        // The run of one style and font the next piece belongs to: shaping and measured widths
+        // are kept by where a run starts.
+        let (mut run_start, mut run_end) = (0, 0);
         while pos < row.len() {
             let Some(item) = row.get(pos) else { break };
             let source = lines.get(item.1).unwrap_or(first);
-            let end = styled_run_end(row, pos);
+            if pos >= run_end {
+                run_start = pos;
+                run_end = styled_run_end(row, pos);
+            }
+            // A whole run, or on a stretched row a word with the spaces after it.
+            let end = stretch.piece_end(pos, run_end, shaped_runs.contains_key(&(row_index, run_start)));
             let segment = row.get(pos..end).unwrap_or_default();
             let string: String = segment.iter().map(|c| c.0).collect();
             let m = metrics.get(&item.2).ok_or_else(|| EditError::Invalid("the paragraph font is missing".into()))?;
@@ -2177,7 +2301,7 @@ pub(crate) fn rewrite_styled_block(
             if let Some(s) = overrides.get(&item.1).and_then(|r| r.scale).or(style.scale) {
                 state.scale = (s / 100.0).clamp(0.1, 10.0);
             }
-            if !shaped_runs.contains_key(&(row_index, pos)) {
+            if !shaped_runs.contains_key(&(row_index, run_start)) {
                 state.scale *= calibration.get(&item.1).copied().unwrap_or(1.0);
             }
             if let Some([r, g, b]) = overrides.get(&item.1).and_then(|r| r.color).or(style.color) {
@@ -2188,14 +2312,18 @@ pub(crate) fn rewrite_styled_block(
             let (ax, ay) = back.apply(x - source.origin.x, baseline - source.origin.baseline);
             tm[4] += ax;
             tm[5] += ay;
-            let mut segment_width = segment_advances.get(&(row_index, pos)).copied().unwrap_or(0.0);
+            let run_widths = char_advances.get(&(row_index, run_start)).map(Vec::as_slice).unwrap_or(&[]);
+            let widths = run_widths.get(pos.saturating_sub(run_start)..end.saturating_sub(run_start)).unwrap_or(&[]);
+            let whole_run = pos == run_start && end == run_end;
+            let mut segment_width =
+                if whole_run { segment_advances.get(&(row_index, run_start)).copied().unwrap_or(0.0) } else { widths.iter().sum() };
             // Each run in its own graphics state, restating what its source set inside its text
             // object (`gs`, stroke, line width, `Tr`; #3508/#3509) from the state the rewrite is
             // drawn in: a `gs` has no inverse, so one run's ExtGState would stay for the next.
             block_ops.push(Op::new("q", vec![]));
             block_ops.extend(state.paint_ops(drawn_from, run_ctm));
-            if let Some(shaped) = shaped_runs.get(&(row_index, pos)) {
-                let resources = glyph_resources.get(&(row_index, pos)).ok_or_else(|| EditError::Invalid("shaped font is missing".into()))?;
+            if let Some(shaped) = shaped_runs.get(&(row_index, run_start)) {
+                let resources = glyph_resources.get(&(row_index, run_start)).ok_or_else(|| EditError::Invalid("shaped font is missing".into()))?;
                 let drawing = ShapedRunDrawing {
                     doc,
                     fonts: &fonts,
@@ -2223,9 +2351,10 @@ pub(crate) fn rewrite_styled_block(
             }
             // A space reassigned onto a neighbour keeps that neighbour's grouping key, and its
             // own style for the underline. Stroke each run of one underline style separately.
-            let widths = char_advances.get(&(row_index, pos)).map(Vec::as_slice).unwrap_or(&[]);
+            // The room after the piece's spaces is underlined with it, so the line has no breaks.
+            let room = stretch.room(pos, end);
             for (style_index, from, to) in
-                segment_underline_runs(widths, segment_width, x, item.1, space_styles.get(row_index).map(Vec::as_slice), pos)
+                segment_underline_runs(widths, segment_width + room, x, item.1, space_styles.get(row_index).map(Vec::as_slice), pos)
             {
                 let source = lines.get(style_index).unwrap_or(first);
                 if underlines.get(&style_index).copied().or(style.underline) != Some(true) || to <= from {
@@ -2242,7 +2371,7 @@ pub(crate) fn rewrite_styled_block(
                 block_ops.push(Op::new("S", vec![]));
             }
             block_ops.push(Op::new("Q", vec![]));
-            x += segment_width;
+            x += segment_width + room;
             pos = end;
         }
         baseline -= row_step(style, anchor.size, source_leading);

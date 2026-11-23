@@ -249,29 +249,53 @@ fn balanced(text: &str) -> bool {
 /// A line in logical order, in the order it must be drawn (left to right), without the bidi
 /// controls fonts can't draw.
 pub fn to_visual(logical: &str) -> String {
-    let text: String = logical.chars().filter(|c| !is_bidi_control(*c)).collect();
-    if !text.chars().any(is_rtl) {
-        return text;
+    visual_order(logical).into_iter().map(|(_, c)| c).collect()
+}
+
+/// [`to_visual`] character by character: for each character drawn, left to right, which
+/// character of `logical` it is (counted in characters) and what is drawn for it (a bracket in a
+/// right-to-left run is mirrored). A row of text in several styles is put in drawing order with
+/// this, each character keeping its style.
+pub(crate) fn visual_order(logical: &str) -> Vec<(usize, char)> {
+    let kept: Vec<(usize, char)> = logical.chars().enumerate().filter(|(_, c)| !is_bidi_control(*c)).collect();
+    if !kept.iter().any(|(_, c)| is_rtl(*c)) {
+        return kept;
     }
+    let text: String = kept.iter().map(|(_, c)| *c).collect();
     let level = if rtl_base(&text) { Level::rtl() } else { Level::ltr() };
     let info = BidiInfo::new(&text, Some(level));
-    let mut out = String::with_capacity(text.len());
+    let mut out = Vec::with_capacity(kept.len());
     for para in &info.paragraphs {
         let (levels, runs) = info.visual_runs(para, para.range.clone());
         for run in runs {
             let rtl = levels.get(run.start).is_some_and(|l| l.is_rtl());
             // Runs lie on character boundaries; a missing slice is skipped, never a panic.
-            let Some(piece) = text.get(run) else { continue };
+            let (Some(before), Some(piece)) = (text.get(..run.start), text.get(run)) else { continue };
+            let first = before.chars().count();
+            let characters = kept.get(first..first.saturating_add(piece.chars().count())).unwrap_or_default();
             if rtl {
-                for c in clusters(piece).iter().rev() {
-                    out.push_str(&c.mirror().text);
-                }
+                push_reversed(characters, &mut out);
             } else {
-                out.push_str(piece);
+                out.extend_from_slice(characters);
             }
         }
     }
     out
+}
+
+/// Appends the characters of a right-to-left run in drawing order: its clusters last to first,
+/// each with its base mirrored and its marks still after it.
+fn push_reversed(characters: &[(usize, char)], out: &mut Vec<(usize, char)>) {
+    let mut end = characters.len();
+    while end > 0 {
+        let mut start = end.saturating_sub(1);
+        while start > 0 && characters.get(start).is_some_and(|(_, c)| is_mark(*c)) {
+            start = start.saturating_sub(1);
+        }
+        let cluster = characters.get(start..end).unwrap_or_default();
+        out.extend(cluster.iter().enumerate().map(|(place, (index, c))| (*index, if place == 0 { mirrored(*c) } else { *c })));
+        end = start;
+    }
 }
 
 #[cfg(test)]

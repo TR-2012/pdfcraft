@@ -65,14 +65,20 @@ pub fn cjk_fallback(c: char) -> bool {
 /// Korean and Japanese faces; with `latin`, its runs of [`latin_fallback`] characters shaped with
 /// the bundled Inter face; and the text between them, left to the standard font. An error when a
 /// run can't be shaped (no Thai face, a missing character).
+///
+/// In a build that draws what nothing has a glyph for ([`crate::last_resort::draws`]), the
+/// characters the standard font has no code for and none of those faces took are drawn by the
+/// last resort, with `latin` or `cjk`, and so is a run its face can't shape: no error then.
 pub fn fallback_pieces(line: &str, thai: bool, latin: bool, cjk: bool) -> Result<Vec<Piece>, GlyphError> {
     #[derive(Clone, Copy, PartialEq)]
     enum Run {
         Thai,
         Latin,
         Cjk(ShapedScript),
+        LastResort,
         Standard,
     }
+    let last_resort = crate::last_resort::draws();
     let kind = |c: char| {
         if thai && is_thai(c) {
             Run::Thai
@@ -80,9 +86,17 @@ pub fn fallback_pieces(line: &str, thai: bool, latin: bool, cjk: bool) -> Result
             Run::Cjk(script)
         } else if latin && latin_fallback(c) {
             Run::Latin
+        } else if last_resort && (latin || cjk) && crate::last_resort::takes(c) {
+            Run::LastResort
         } else {
             Run::Standard
         }
+    };
+    // What a face can't shape (the build has no such face, or it lacks a character) is drawn
+    // character by character instead of failing the line.
+    let or_last_resort = |shaped: Result<Vec<ShapedCluster>, GlyphError>, text: &str| match shaped {
+        Err(_) if last_resort => Ok(crate::last_resort::shape(text, false)),
+        other => other,
     };
     let mut runs: Vec<(Run, String)> = Vec::new();
     for c in line.chars() {
@@ -111,9 +125,10 @@ pub fn fallback_pieces(line: &str, thai: bool, latin: bool, cjk: bool) -> Result
     }
     runs.into_iter()
         .map(|(run, s)| match run {
-            Run::Thai => shape_thai(&s).map(Piece::Shaped),
-            Run::Latin => shape_latin(&s).map(Piece::Shaped),
-            Run::Cjk(script) => crate::shape_cjk(&s, script).map(Piece::Shaped),
+            Run::Thai => or_last_resort(shape_thai(&s), &s).map(Piece::Shaped),
+            Run::Latin => or_last_resort(shape_latin(&s), &s).map(Piece::Shaped),
+            Run::Cjk(script) => or_last_resort(crate::shape_cjk(&s, script), &s).map(Piece::Shaped),
+            Run::LastResort => Ok(Piece::Shaped(crate::last_resort::shape(&s, false))),
             Run::Standard => Ok(Piece::Latin(s)),
         })
         .collect()
@@ -128,7 +143,10 @@ fn is_mark(c: char) -> bool {
 /// measured by `standard`. Text with nothing for the fallback faces, or that they can't shape, is
 /// measured by `standard` as a whole (drawing then reports why).
 pub fn fallback_width(text: &str, size: f64, thai: bool, latin: bool, cjk: bool, standard: impl Fn(&str, f64) -> f64) -> f64 {
-    if !text.chars().any(|c| (thai && is_thai(c)) || (latin && latin_fallback(c)) || (cjk && cjk_fallback(c))) {
+    let last_resort = (latin || cjk) && crate::last_resort::draws();
+    let needs =
+        |c: char| (thai && is_thai(c)) || (latin && latin_fallback(c)) || (cjk && cjk_fallback(c)) || (last_resort && crate::last_resort::takes(c));
+    if !text.chars().any(needs) {
         return standard(text, size);
     }
     match fallback_pieces(text, thai, latin, cjk) {
@@ -356,7 +374,9 @@ pub fn appearance_lines(lines: &[String], fonts: &mut Dict) -> (Vec<Vec<Piece>>,
 /// caller reports that.
 pub fn fallback_appearance_lines(lines: &[String], thai: bool, latin: bool, cjk: bool, fonts: &mut Dict) -> (Vec<Vec<Piece>>, ShapedFonts) {
     let plain = |l: &String| vec![Piece::Latin(l.clone())];
-    let needs = |c: char| (thai && is_thai(c)) || (latin && latin_fallback(c)) || (cjk && cjk_fallback(c));
+    let last_resort = (latin || cjk) && crate::last_resort::draws();
+    let needs =
+        |c: char| (thai && is_thai(c)) || (latin && latin_fallback(c)) || (cjk && cjk_fallback(c)) || (last_resort && crate::last_resort::takes(c));
     let pieces: Vec<Vec<Piece>> = lines
         .iter()
         .map(|l| if l.chars().any(needs) { fallback_pieces(l, thai, latin, cjk).unwrap_or_else(|_| plain(l)) } else { plain(l) })
@@ -410,6 +430,11 @@ pub fn first_undrawable_in_line(line: &str) -> Option<char> {
 }
 
 fn undrawable_in_line(line: &str, draws_cjk: bool) -> Option<char> {
+    // A text box's appearance leaves nothing as `?` where the last resort draws: what no face
+    // has, and Thai its face can't shape, come out of [`fallback_pieces`] drawn.
+    if draws_cjk && crate::last_resort::draws() {
+        return None;
+    }
     let thai_fails = line.chars().any(is_thai) && thai_pieces(line).is_err();
     line.chars().find(|c| {
         if is_thai(*c) {
@@ -501,6 +526,7 @@ fn type3_font(clusters: &[&ShapedCluster], outlines: &HashMap<(ShapedScript, u32
                 ShapedScript::Latin => "Inter",
                 ShapedScript::Korean { .. } => "Korean",
                 ShapedScript::Japanese { .. } => "Japanese",
+                ShapedScript::LastResort => "PdfCraft Last Resort",
             },
             |f| f.family,
         ),
@@ -720,5 +746,29 @@ mod tests {
         let text: String = clusters([pieces.as_slice()]).map(|c| c.text.as_str()).collect();
         assert_eq!(text, "ชื่อบุญฤทธิ์");
         assert!(thai_width("น้ำ", 10.0, |_, _| 0.0) > 0.0);
+    }
+
+    /// Where the build has the last resort, an appearance draws the characters the standard font
+    /// has no code for and no fallback face has, one glyph each, and reports none of them as `?`.
+    /// Every other build leaves them to the standard font and reports them.
+    #[test]
+    fn what_no_face_has_is_drawn_by_the_last_resort_where_the_build_has_it() {
+        let unassigned = '\u{0378}';
+        let line = format!("Ab \u{0540}{unassigned} c");
+        if !crate::embedding::accepts_any_document_font() {
+            assert!(matches!(&fallback_pieces(&line, false, true, true).unwrap()[..], [Piece::Latin(all)] if *all == line));
+            assert_eq!(first_undrawable(&line), Some('\u{0540}'));
+        }
+        crate::last_resort::DRAWS.with(|draws| draws.set(true));
+        let pieces = fallback_pieces(&line, false, true, true).unwrap();
+        assert!(matches!(&pieces[..], [Piece::Latin(a), Piece::Shaped(drawn), Piece::Latin(b)] if a == "Ab " && b == " c" && drawn.len() == 2));
+        assert!(clusters([pieces.as_slice()]).all(|c| c.script == ShapedScript::LastResort));
+        assert_eq!(first_undrawable(&line), None);
+        assert!(fallback_width(&unassigned.to_string(), 10.0, false, true, true, |_, _| 0.0) > 0.0, "the box has its own width");
+        // The outlines are made, so the fonts for them are built without a face.
+        let mut fonts = Dict::new();
+        let (_, shaped) = fallback_appearance_lines(&[line], false, true, true, &mut fonts);
+        assert!(clusters([pieces.as_slice()]).all(|c| shaped.code(c).is_some()));
+        crate::last_resort::DRAWS.with(|draws| draws.set(false));
     }
 }

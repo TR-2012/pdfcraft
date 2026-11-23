@@ -284,6 +284,10 @@ pub(super) fn is_hebrew(c: char) -> bool {
 /// draw (or that has no face to draw it). Page-content tools refuse such text; the Add-text editor
 /// keeps it open.
 pub fn first_undrawable(t: &AddedText) -> Option<char> {
+    // Where the build has the last resort, it draws what no face has or can shape: nothing is `?`.
+    if crate::text::draws_undrawable_characters() {
+        return None;
+    }
     if t.text.chars().any(is_thai) {
         if let Some(c) = t.text.chars().find(|c| is_thai(*c) && !pdfcraft_fonts::thai_has(*c)) {
             return Some(c);
@@ -387,18 +391,24 @@ pub(super) fn shaped_layout(t: &AddedText, line: &str, rtl: bool) -> Result<(Vec
         for (script, s) in segments {
             pieces.push(if let Some(script) = script {
                 let shaped = match script {
-                    ShapedScript::Arabic => shape_arabic(&s, run_rtl).map_err(|e| arabic_error(e, &s))?,
-                    ShapedScript::Hebrew => shape_hebrew(&s, run_rtl).map_err(|e| hebrew_error(e, &s))?,
-                    ShapedScript::Thai => shape_thai(&s).map_err(|e| thai_error(e, &s))?,
+                    ShapedScript::Arabic => shape_arabic(&s, run_rtl).map_err(|e| arabic_error(e, &s)),
+                    ShapedScript::Hebrew => shape_hebrew(&s, run_rtl).map_err(|e| hebrew_error(e, &s)),
+                    ShapedScript::Thai => shape_thai(&s).map_err(|e| thai_error(e, &s)),
                     ShapedScript::Korean { .. } | ShapedScript::Japanese { .. } => {
-                        pdfcraft_fonts::shape_cjk(&s, script).map_err(|e| cjk_error(e, &s))?
+                        pdfcraft_fonts::shape_cjk(&s, script).map_err(|e| cjk_error(e, &s))
                     }
                     // Not a script this layout splits out; shaped as such all the same.
                     ShapedScript::Latin => {
-                        pdfcraft_fonts::shape_latin(&s).map_err(|e| EditError::Invalid(pdfcraft_fonts::shaped_text::latin_message(e, &s)))?
+                        pdfcraft_fonts::shape_latin(&s).map_err(|e| EditError::Invalid(pdfcraft_fonts::shaped_text::latin_message(e, &s)))
                     }
+                    ShapedScript::LastResort => Ok(pdfcraft_fonts::last_resort::shape(&s, run_rtl)),
                 };
-                Piece::Shaped(shaped)
+                // A run its face can't shape (the build has no such face, or it lacks a
+                // character) is drawn character by character where the build has the last resort.
+                Piece::Shaped(match shaped {
+                    Err(_) if crate::text::draws_undrawable_characters() => pdfcraft_fonts::last_resort::shape(&s, run_rtl),
+                    shaped => shaped?,
+                })
             } else if run_rtl {
                 Piece::Latin(s.chars().rev().map(mirrored).collect())
             } else {
@@ -452,8 +462,13 @@ pub(super) fn cjk_error(e: GlyphError, text: &str) -> EditError {
 
 /// The Korean or Japanese face that draws `c` in the item, in its Myeongjo or Mincho kind when the
 /// item is set in Times. `None` for other characters and when the build has no face with it.
+///
+/// Where the build has the last resort, a character the item's standard font has no code for and
+/// no such face has is given to it ([`ShapedScript::LastResort`]): it is laid out, wrapped and
+/// drawn like those faces' characters, one glyph each.
 pub(super) fn cjk_face(t: &AddedText, c: char) -> Option<ShapedScript> {
-    pdfcraft_fonts::cjk_script(c, t.family == Family::Times)
+    let last_resort = || (crate::text::draws_undrawable_characters() && pdfcraft_fonts::last_resort::takes(c)).then_some(ShapedScript::LastResort);
+    pdfcraft_fonts::cjk_script(c, t.family == Family::Times).or_else(last_resort)
 }
 
 /// Whether the item has Korean or Japanese a craft-fonts face draws (so `draw` lays it out with

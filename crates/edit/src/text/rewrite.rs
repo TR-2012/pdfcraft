@@ -4,7 +4,7 @@ use super::fallback::{
     source_character_advance, source_encodes, source_fallback_runs, source_family, source_program_completes, source_runs, source_show, source_space,
     source_width, type3_encode, type3_font,
 };
-use super::interp::{Carry, Origin, TextState, interpret};
+use super::interp::{Carry, Origin, TextState, interpret, to_frame, union};
 use super::lines::{
     content_streams, dropped_advances, dropped_side_effects, joined, page_dict, reopen_text_object, rewritten_contents, show_side_effects, splice,
     text_lines,
@@ -32,14 +32,60 @@ pub fn replace_line(doc: &mut Document, page: usize, line: usize, text: &str) ->
 /// glyphs are not ink but a mask, and whatever is painted through them takes their shape.
 /// Removing the glyphs removes the mask, and the fill or image behind floods its own rectangle
 /// instead -- the artwork is destroyed, in a file that still opens without a warning (#3429).
-/// `clear_block` already refuses these for the same reason.
+/// `clear_block` leaves these in place for the same reason.
 ///
 /// Every line the rewrite drops is checked, not only the one being replaced: a line's runs need
 /// not share a rendering mode (see [`TextLine::clips`]), and [`coincident_ops`] drops a whole
 /// overlapping line without regard to its mode -- so a mask could go with text that is ink.
-fn refuse_clipping_text(lines: &[TextLine], dropped: &std::collections::HashSet<usize>) -> Result<(), EditError> {
-    if lines.iter().any(|l| l.clips && l.ops.iter().any(|op| dropped.contains(op))) {
+///
+/// The lines `rewritten` (indices into `lines`) are passed over: a paragraph that is itself the
+/// mask is written back as one ([`clipping_block_ops`]), so nothing is lost with it.
+fn refuse_clipping_text(lines: &[TextLine], dropped: &std::collections::HashSet<usize>, rewritten: &[usize]) -> Result<(), EditError> {
+    let lost = |(index, line): (usize, &TextLine)| line.clips && !rewritten.contains(&index) && line.ops.iter().any(|op| dropped.contains(op));
+    if lines.iter().enumerate().any(lost) {
         return Err(EditError::Invalid("text used as a clipping path cannot be edited: its glyphs mask the artwork behind them".into()));
+    }
+    Ok(())
+}
+
+/// What a rewritten mask needs in order to stay one ([`clipping_block_ops`]), checked before
+/// anything is written. Its glyphs must come from a font program or a standard font: a generated
+/// (Type 3) font is painted whatever the rendering mode, so its glyphs would show as ink and mask
+/// nothing. And the paragraph must be all the text of one text object: a mask is what one text
+/// object adds up to, so text left behind in it would be cut away by the new mask. All of it
+/// must be drawn in the one clipping mode (`modes`: each show operator's), since it is written
+/// back in the mode of its first run: ink among it would turn into mask, or mask into ink.
+fn refuse_unmaskable_text(
+    ops: &[Op],
+    (first, emit): (&Origin, &Origin),
+    dropped: &std::collections::HashSet<usize>,
+    modes: &HashMap<usize, (Matrix, i64)>,
+    generated_font: bool,
+) -> Result<(), EditError> {
+    let mode = first.state.render_mode;
+    let in_one_mode = dropped.iter().all(|op| modes.get(op).is_none_or(|(_, run_mode)| *run_mode == mode));
+    if !(4..=7).contains(&mode) || !in_one_mode {
+        return Err(EditError::Invalid(
+            "text used as a clipping path can be edited only when the whole paragraph is the mask: here part of it is ink, \
+             and rewriting it would turn that ink into mask or the mask into ink"
+                .into(),
+        ));
+    }
+    if generated_font {
+        return Err(EditError::Invalid(
+            "text used as a clipping path can take only characters its own font has: any other character would be painted over the artwork \
+             instead of masking it. Type characters the mask already uses"
+                .into(),
+        ));
+    }
+    let shows = ops.iter().enumerate().skip(emit.bt_op).take_while(|(_, op)| !op.is("ET"));
+    let mut kept_shows = shows.filter(|(index, op)| matches!(op.op.as_slice(), b"Tj" | b"TJ" | b"'" | b"\"") && !dropped.contains(index));
+    if first.bt_op != emit.bt_op || kept_shows.next().is_some() {
+        return Err(EditError::Invalid(
+            "text used as a clipping path can be edited only when the paragraph is all the text of its text object: \
+             the rest of the mask would be cut away. Select the whole mask text"
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -55,7 +101,7 @@ pub(crate) fn replace_line_with_limit(doc: &mut Document, page: usize, line: usi
     // leaves the document untouched.
     let mut drops = coincident_ops(&lines, &[&target]);
     drops.extend(target.ops.iter().copied());
-    refuse_clipping_text(&lines, &drops)?;
+    refuse_clipping_text(&lines, &drops, &[])?;
     let p = page_dict(doc, page)?;
     let mut res = p.dict.get(b"Resources").map(|r| doc.resolve(r)).and_then(|r| r.as_dict().cloned()).unwrap_or_default();
     let mut fonts_res = res.get(b"Font").map(|f| doc.resolve(f)).and_then(|f| f.as_dict().cloned()).unwrap_or_default();
@@ -326,6 +372,36 @@ pub(crate) fn rewrite_block_with_limit(
     TextSession::open(doc, page, block)?.commit_with_limit(doc, text, style, max_glyphs)
 }
 
+/// The styled rewrite for a paragraph turned on the page. That rewrite lays rows out along page
+/// x, so the paragraph is handed to it as it lies in the frame of its own baseline
+/// ([`TextLine::in_frame`]): there it is upright. What the rewrite then places in page space
+/// (row steps, alignment, underlines, a move) is turned back by each line's CTM, which carries
+/// the same turn.
+fn rewrite_turned_styled_block(
+    doc: &mut Document,
+    page: usize,
+    block: &TextBlock,
+    lines: &[TextLine],
+    text: Option<&str>,
+    style: &BlockStyle,
+    max_glyphs: usize,
+) -> Result<LineEdit, EditError> {
+    let first =
+        block.lines.first().and_then(|index| lines.get(*index)).ok_or_else(|| EditError::Invalid("the paragraph has no source runs".into()))?;
+    let dir = first.direction();
+    let upright_lines: Vec<TextLine> = lines.iter().map(|line| line.in_frame(dir)).collect();
+    let members = block.lines.iter().filter_map(|index| upright_lines.get(*index));
+    let rect = members.map(|line| line.rect).reduce(union).unwrap_or(block.rect);
+    let upright_block = TextBlock { rect, ..block.clone() };
+    // A move is given in page space: along and across the baseline in the frame.
+    let offset = style.offset.map(|[dx, dy]| {
+        let (along, across) = to_frame(dir, (dx, dy));
+        [along, across]
+    });
+    let upright_style = BlockStyle { offset, ..style.clone() };
+    rewrite_styled_block(doc, page, &upright_block, &upright_lines, text, &upright_style, max_glyphs)
+}
+
 struct RewriteDispatch {
     upright: bool,
     use_styled_path: bool,
@@ -341,20 +417,14 @@ fn choose_rewrite_path(
     style: &BlockStyle,
 ) -> Result<RewriteDispatch, EditError> {
     let registered_face = fonts.iter().any(|(name, _)| name.starts_with(b"PCFull"));
-    // Hebrew is written back in drawing order by the single-style path. Styled regions do not
-    // reorder right-to-left runs.
+    // Hebrew is written back in drawing order by the single-style path. The styled one takes it
+    // only for what that path can't do, formatting part of it or a chosen document font, and
+    // then puts each row in drawing order itself.
     let hebrew = text.unwrap_or(&block.text).chars().any(crate::bidi::is_hebrew);
-    if hebrew && (!style.ranges.is_empty() || style.resource.is_some()) {
-        return Err(EditError::Invalid(
-            "formatting part of right-to-left (Hebrew) text, or choosing a document font for it, isn't supported yet".into(),
-        ));
-    }
-    // Turned text is rewritten in its own text space by the single-style path. Styled layout uses
-    // page x-coordinates and cannot safely apply those operations to rotated runs.
+    // Turned text is rewritten in its own text space by the single-style path. The styled one
+    // lays rows out along page x, so it takes turned text only for the same two things, in the
+    // frame of the paragraph's baseline ([`rewrite_turned_styled_block`]).
     let upright = members.iter().all(|line| line.upright());
-    if !upright && (!style.ranges.is_empty() || style.resource.is_some()) {
-        return Err(EditError::Invalid("formatting part of turned text, or choosing a document font for it, isn't supported yet".into()));
-    }
     let visual_indic = members.iter().any(|line| line.visual_order);
     let has_special_text = text.is_some_and(|draft| {
         draft.contains(row_break)
@@ -366,13 +436,8 @@ fn choose_rewrite_path(
     let source_requires_styled_path =
         has_special_text || registered_face || text.is_some_and(|draft| source_program_completes(doc, fonts, first, draft)) || has_multiple_runs;
     let explicit_styled_text = !style.ranges.is_empty() || style.resource.is_some();
-    Ok(RewriteDispatch {
-        upright,
-        use_styled_path: upright
-            && !hebrew
-            && !visual_indic
-            && (explicit_styled_text || (source_requires_styled_path && style.family.is_none() && style.bold.is_none())),
-    })
+    let plain_styled_text = upright && !hebrew && source_requires_styled_path && style.family.is_none() && style.bold.is_none();
+    Ok(RewriteDispatch { upright, use_styled_path: !visual_indic && (explicit_styled_text || plain_styled_text) })
 }
 
 /// The paragraph's text for writing back: explicit line breaks stay (#1443), and so does each typed
@@ -983,6 +1048,50 @@ fn block_ops(
     Ok(ops)
 }
 
+/// [`block_ops`] for a paragraph whose glyphs are a clipping path (`4 Tr` to `7 Tr`): the mask
+/// the artwork after it is painted through. It is one text object, since every row adds to the
+/// same mask, and it is not inside a `q`/`Q`, which would end the mask with the paragraph.
+///
+/// What it sets is set back after it: the rendering mode here, the text state and fill colour by
+/// the caller. An ExtGState, stroke colour or line width that the paragraph's own text object set
+/// before its text stays set, as that object, which follows this one, sets it again anyway.
+fn clipping_block_ops(
+    plan: &BlockPlan<'_>,
+    writer: &LineWriter<'_>,
+    wrapped: &[(String, bool, usize)],
+    gaps: &[f64],
+    show_font: String,
+) -> Result<Vec<Op>, EditError> {
+    let n = pdfcraft_content::num;
+    let mut ops = plan.state.paint_ops(plan.after, plan.emit.ctm);
+    ops.push(Op::new("BT", vec![]));
+    let mut state = plan.state.clone();
+    state.word_spacing = 0.0;
+    let mut cursor = LineCursor { x: 0.0, y: 0.0, tw_set: 0.0, shown_font: show_font.clone() };
+    state.font = Some((show_font, plan.size));
+    if let Some([r, g, bl]) = plan.style.color {
+        state.fill = vec![Op::new("rg", vec![n(r), n(g), n(bl)])];
+    }
+    ops.extend(state.ops());
+    ops.push(Op::new("Tr", vec![Object::Int(plan.state.render_mode)]));
+    // Moved: a translation of the text matrix, there being no `q` to end a `cm` with.
+    let mut tm = plan.tm;
+    if let Some((ax, ay)) = plan.movement {
+        tm[4] += ax;
+        tm[5] += ay;
+    }
+    ops.push(Op::new("Tm", tm.iter().map(|v| n(*v)).collect()));
+    let underlines = writer.write_all(wrapped, gaps, &mut cursor, &mut ops)?;
+    ops.push(Op::new("ET", vec![]));
+    if (0..=7).contains(&plan.after.render_mode) {
+        ops.push(Op::new("Tr", vec![Object::Int(plan.after.render_mode)]));
+    }
+    if plan.underline {
+        ops.extend(underline_ops(&state.fill, &tm, plan.size, &underlines));
+    }
+    Ok(ops)
+}
+
 /// Whether text shown earlier in the same text object stays first: the paragraph then goes where
 /// its last row was, after any backgrounds between the rows, or between two halves of the text
 /// object. The paragraph's own operators (and another drawing on the same baseline: a fake-bold
@@ -1071,10 +1180,12 @@ pub(crate) fn rewrite_block_from(
         None => style,
     };
     let members: Vec<&TextLine> = b.lines.iter().map(|i| &lines[*i]).collect();
-    // One clipping run is enough: rewriting the paragraph would drop its mask with the rest.
     let mut dropped = coincident_ops(&lines, &members);
     dropped.extend(members.iter().flat_map(|l| l.ops.iter().copied()));
-    refuse_clipping_text(&lines, &dropped)?;
+    // A paragraph that is itself a mask is written back as one, by the single-style path, which
+    // draws every row in one text object. A mask that would only go along with it is refused.
+    let clips = members.iter().any(|l| l.clips);
+    refuse_clipping_text(&lines, &dropped, &b.lines)?;
     let first = members.first().copied().ok_or_else(|| EditError::Invalid("the paragraph has no source runs".into()))?;
     members.iter().try_for_each(|line| line.ensure_editable())?;
     let p = page_dict(doc, page)?;
@@ -1083,16 +1194,16 @@ pub(crate) fn rewrite_block_from(
     if b.invisible {
         crate::check_on_top(doc, &p)?;
     }
-    if let Some(edit) = text.and_then(|draft| rewrite_changed_words(doc, page, &b, &lines, draft, style, max_glyphs)) {
+    if let Some(edit) = text.filter(|_| !clips).and_then(|draft| rewrite_changed_words(doc, page, &b, &lines, draft, style, max_glyphs)) {
         return Ok(edit);
     }
     let mut res = p.dict.get(b"Resources").map(|r| doc.resolve(r)).and_then(|r| r.as_dict().cloned()).unwrap_or_default();
     let mut fonts_res = res.get(b"Font").map(|f| doc.resolve(f)).and_then(|f| f.as_dict().cloned()).unwrap_or_default();
     let dispatch = choose_rewrite_path(doc, &fonts_res, &b, &members, first, text, style)?;
-    if dispatch.use_styled_path && style.align == Some(crate::added::Align::Justify) {
-        return Err(EditError::Invalid("justification of mixed-style existing paragraphs is not supported".into()));
-    }
-    if dispatch.use_styled_path {
+    if dispatch.use_styled_path && !clips {
+        if !dispatch.upright {
+            return rewrite_turned_styled_block(doc, page, &b, &lines, text, style, max_glyphs);
+        }
         return rewrite_styled_block(doc, page, &b, &lines, text, style, max_glyphs);
     }
     let upright = dispatch.upright;
@@ -1159,6 +1270,10 @@ pub(crate) fn rewrite_block_from(
     let right_edge = if anchored_right { (b.rect[2] - b.rect[0]).max(0.0) } else { width };
     let movement = drawn_movement(emit.ctm, dx, dy)?;
     let tm = emit_text_matrix(o, emit)?;
+    if clips {
+        let modes = show_starts(doc, &ops, &res)?;
+        refuse_unmaskable_text(&ops, (o, emit), &dropped, &modes, !reuse && needs_type3(&flat))?;
+    }
     let type3 = if !reuse && needs_type3(&flat) {
         let missing: String = flat.chars().filter(|ch| !source_chars.contains(ch)).collect();
         Some(type3_font(doc, &mut fonts_res, &missing, family, bold, max_glyphs)?)
@@ -1252,7 +1367,8 @@ pub(crate) fn rewrite_block_from(
         size,
         underline: style.underline == Some(true),
     };
-    let mut block_ops = block_ops(&plan, &writer, &wrapped, &gaps, font.show_font.clone())?;
+    let write_block = if clips { clipping_block_ops } else { block_ops };
+    let mut block_ops = write_block(&plan, &writer, &wrapped, &gaps, font.show_font.clone())?;
     let on_top = crate::lift_on_top(over, &mut block_ops);
     block_ops.extend(after.ops().into_iter().filter(|op| !op.is("Tf") || after.font.is_some()));
     if split {

@@ -782,7 +782,11 @@ fn draws(doc: &Document, f: &Field, wd: &Dict, text: &str) -> bool {
         return enc.first_unencodable(text).is_none();
     }
     let draws_cjk = matches!(f.kind, FieldKind::Text | FieldKind::Combo) && !f.is_comb();
-    let from_a_fallback_face = |c: char| shaped_text::latin_fallback(c) || (draws_cjk && shaped_text::cjk_fallback(c));
+    // Where the build has the last resort, it draws what none of these faces has, so nothing is `?`.
+    let last_resort = pdfcraft_fonts::last_resort::draws();
+    let from_a_fallback_face = |c: char| {
+        shaped_text::latin_fallback(c) || (draws_cjk && shaped_text::cjk_fallback(c)) || (last_resort && pdfcraft_fonts::last_resort::takes(c))
+    };
     let rest: String = text.chars().filter(|c| !from_a_fallback_face(*c)).collect();
     let enc = dr.filter(|enc| enc.can_encode(&rest)).unwrap_or(FontText::WinAnsi);
     enc.first_unencodable(&rest).is_none()
@@ -792,7 +796,8 @@ fn draws(doc: &Document, f: &Field, wd: &Dict, text: &str) -> bool {
 /// build can't draw (it has no Thai face, or the face lacks a character), which would come out
 /// as `?`. `None` for text it can draw, and for a password field, which shows `*`.
 pub(crate) fn thai_refusal(doc: &Document, f: &Field, text: &str) -> Option<String> {
-    if f.has(flags::PASSWORD) || !text.chars().any(shaped_text::is_thai) {
+    // Thai no face here shapes is drawn by the last resort where the build has it: not refused.
+    if f.has(flags::PASSWORD) || !text.chars().any(shaped_text::is_thai) || pdfcraft_fonts::last_resort::draws() {
         return None;
     }
     let held = |w: &Widget| {
@@ -834,10 +839,13 @@ fn field_appearance_fit(doc: &Document, f: &Field, w: &Widget, values: &[String]
         values.first().cloned().unwrap_or_default()
     };
     let text = if f.has(flags::PASSWORD) { "*".repeat(text.chars().count()) } else { text };
-    // Whether `enc` holds what is shown; with `skip_latin`, leaving out what the bundled face draws.
+    // Whether `enc` holds what is shown; with `skip_latin`, leaving out what the bundled face draws,
+    // and what the last resort draws where the build has it (a character no font here holds).
+    let last_resort = pdfcraft_fonts::last_resort::draws();
+    let drawn_beside_the_font = |c: char| shaped_text::latin_fallback(c) || (last_resort && pdfcraft_fonts::last_resort::takes(c));
     let can_show = |enc: &FontText, text: &str, skip_latin: bool| {
         let holds = |s: &str| {
-            if skip_latin { enc.can_encode(&s.chars().filter(|c| !shaped_text::latin_fallback(*c)).collect::<String>()) } else { enc.can_encode(s) }
+            if skip_latin { enc.can_encode(&s.chars().filter(|c| !drawn_beside_the_font(*c)).collect::<String>()) } else { enc.can_encode(s) }
         };
         if f.kind == FieldKind::List {
             f.options.iter().all(|(_, display)| holds(display))
