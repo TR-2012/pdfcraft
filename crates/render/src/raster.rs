@@ -130,7 +130,10 @@ impl RenderConfig {
             annotation_overrides: self.annotations.clone(),
             appearance_overrides: self.appearances.clone(),
             font_resolver: Arc::new(move |query| {
-                japanese_fallback(query).or_else(|| system_fonts.then(|| system_fallback(query)).flatten()).or_else(|| standard(query))
+                japanese_fallback(query)
+                    .or_else(|| korean_fallback(query))
+                    .or_else(|| system_fonts.then(|| system_fallback(query)).flatten())
+                    .or_else(|| standard(query))
             }),
             jbig2_work: self.jbig2_work.unwrap_or(defaults.jbig2_work),
             ..defaults
@@ -165,9 +168,40 @@ fn japanese_fallback(query: &FontQuery) -> Option<(FontData, u32)> {
     Some((Arc::new(face.bytes), 0))
 }
 
+/// A Korean face from craft-fonts (NanumGothic, or NanumMyeongjo for a serif font where the build
+/// input has it) for a CID font of the Adobe-Korea1 collection that the PDF doesn't embed
+/// (`HYGoThic-Medium`, `HYSMyeongJo-Medium`, …). Unlike the installed face of [`system_fallback`],
+/// it may be drawn in an export or a print, so a Korean page no longer comes out blank there.
+/// `None` for every other font, and when the build has no Korean face.
+fn korean_fallback(query: &FontQuery) -> Option<(FontData, u32)> {
+    let FontQuery::Fallback(f) = query else { return None };
+    if f.character_collection.as_ref()?.family != CidFamily::AdobeKorea1 {
+        return None;
+    }
+    let serif = korean_font_is_serif(f.post_script_name.as_deref().unwrap_or_default(), f.is_serif);
+    let bold = f.is_bold || f.font_weight >= BOLD_FONT_WEIGHT;
+    let face = pdfcraft_fonts::document_korean_fonts_for_style(serif, bold).into_iter().next()?;
+    Some((Arc::new(face.bytes), 0))
+}
+
+/// Whether the Korean font named `name` is a serif one. The name decides where it says
+/// (`…MyeongJo…`, `Batang` and `Gungsuh` are serif; `…Gothic…`, `Dotum` and `Gulim` are not): the
+/// descriptor's serif flag is often set on a Gothic font too. Any other name goes by that flag.
+fn korean_font_is_serif(name: &str, serif_flag: bool) -> bool {
+    if pdfcraft_fonts::is_korean_serif_family(name) {
+        return true;
+    }
+    let name = name.to_ascii_lowercase();
+    let names_a_gothic_face = ["gothic", "dotum", "gulim"].iter().any(|hint| name.contains(hint));
+    !names_a_gothic_face && serif_flag
+}
+
+/// The OpenType weight from which a font counts as bold (600 is SemiBold).
+const BOLD_FONT_WEIGHT: u32 = 600;
+
 /// An installed face for a CID font of an Adobe CJK collection that the PDF doesn't embed and
-/// craft-fonts has no face for (Traditional and Simplified Chinese, Korean, and Japanese in a
-/// build without craft-fonts). `None` for every other font.
+/// craft-fonts has no face for (Traditional and Simplified Chinese, and Japanese or Korean in a
+/// build without those craft-fonts faces). `None` for every other font.
 fn system_fallback(query: &FontQuery) -> Option<(FontData, u32)> {
     let FontQuery::Fallback(f) = query else { return None };
     crate::system_font::fallback(f)

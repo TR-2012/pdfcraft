@@ -3946,6 +3946,26 @@ fn thai_in_a_times_text_box_keeps_times_for_the_rest() {
     assert!(fonts.get(b"PCTh1").and_then(|f| f.as_dict()).is_some_and(|f| f.name(b"Subtype") == Some(&b"Type3"[..])), "{fonts:?}");
 }
 
+/// Korean and Japanese in a text box are drawn from their craft-fonts faces, as Thai is, beside
+/// the box's own font; they used to come out as `?`.
+#[test]
+fn korean_and_japanese_in_a_text_box_are_drawn_from_their_faces() {
+    let typed = "메모: 한글 テスト 日本語 OK";
+    let contents: String = typed.encode_utf16().map(|unit| format!("{unit:04X}")).collect();
+    let annot =
+        format!("<< /Type /Annot /Subtype /FreeText /Rect [45 630 345 700] /DA (0 g /Helv 12 Tf) /BS << /W 0 >> /Contents <FEFF{contents}> >>");
+    let (ap, fonts) = display_of(&annot);
+    if !typed.chars().filter(|c| !c.is_ascii()).all(|c| pdfcraft_fonts::cjk_fallback(c).is_some()) {
+        eprintln!("built without Korean and Japanese craft-fonts faces (CRAFT_FONTS_DIR unset): the text box shows `?` as before");
+        assert!(ap.contains('?'), "{ap}");
+        return;
+    }
+    assert_eq!(pdfcraft_fonts::shaped_text::first_undrawable(typed), None);
+    assert!(ap.contains("/PCTh1 ") && !ap.contains('?'), "the Korean and Japanese are shaped: {ap}");
+    assert!(ap.contains("( OK) Tj"), "Latin text stays in the box's own font: {ap}");
+    assert!(fonts.get(b"PCTh1").and_then(|f| f.as_dict()).is_some_and(|f| f.name(b"Subtype") == Some(&b"Type3"[..])), "{fonts:?}");
+}
+
 /// `/DS` (Table 177) sets the face, size and colour over `/DA`'s; a malformed one is ignored.
 #[test]
 fn free_text_ds_style_is_drawn() {

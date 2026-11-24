@@ -33,11 +33,19 @@ pub enum ShapedScript {
     /// ([`crate::document_latin_fonts`]), which every build has: for the ones WinAnsiEncoding
     /// lacks, beside the standard font that draws the rest.
     Latin,
-    /// Hangul (and whatever else the Korean face has that the standard fonts lack) in the first
-    /// Korean craft-fonts face.
-    Korean,
-    /// Kana, Han and full-width forms in the Japanese document face.
-    Japanese,
+    /// Hangul in a Korean craft-fonts face: a Gothic one, or a Myeongjo one for `serif` text where
+    /// the build input has it.
+    Korean {
+        serif: bool,
+    },
+    /// Kana, Han ideographs and CJK punctuation in a Japanese craft-fonts face: a Gothic one, or
+    /// a Mincho one for `serif` text.
+    Japanese {
+        serif: bool,
+    },
+    /// No face of the build: a character nothing has a glyph for, drawn by
+    /// [`crate::last_resort`]. Its glyph id is the character's code point.
+    LastResort,
 }
 
 impl ShapedScript {
@@ -47,8 +55,9 @@ impl ShapedScript {
             Self::Hebrew => crate::document_hebrew_font(false),
             Self::Thai => crate::document_thai_font(),
             Self::Latin => crate::document_latin_fonts(false).into_iter().next(),
-            Self::Korean => crate::document_korean_fonts_for_style(false, false).into_iter().next(),
-            Self::Japanese => crate::document_japanese_font_for_style(false, false),
+            Self::Korean { serif } => crate::document_korean_fonts_for_style(serif, false).into_iter().next(),
+            Self::Japanese { serif } => crate::document_japanese_font_for_style(serif, false),
+            Self::LastResort => None,
         }
     }
 }
@@ -59,14 +68,20 @@ fn face(script: ShapedScript) -> Option<&'static (FontRef<'static>, ShaperData)>
     static THAI: OnceLock<Option<(FontRef<'static>, ShaperData)>> = OnceLock::new();
     static LATIN: OnceLock<Option<(FontRef<'static>, ShaperData)>> = OnceLock::new();
     static KOREAN: OnceLock<Option<(FontRef<'static>, ShaperData)>> = OnceLock::new();
+    static KOREAN_SERIF: OnceLock<Option<(FontRef<'static>, ShaperData)>> = OnceLock::new();
     static JAPANESE: OnceLock<Option<(FontRef<'static>, ShaperData)>> = OnceLock::new();
+    static JAPANESE_SERIF: OnceLock<Option<(FontRef<'static>, ShaperData)>> = OnceLock::new();
     let cache = match script {
         ShapedScript::Arabic => &FACE,
         ShapedScript::Hebrew => &HEBREW,
         ShapedScript::Thai => &THAI,
         ShapedScript::Latin => &LATIN,
-        ShapedScript::Korean => &KOREAN,
-        ShapedScript::Japanese => &JAPANESE,
+        ShapedScript::Korean { serif: false } => &KOREAN,
+        ShapedScript::Korean { serif: true } => &KOREAN_SERIF,
+        ShapedScript::Japanese { serif: false } => &JAPANESE,
+        ShapedScript::Japanese { serif: true } => &JAPANESE_SERIF,
+        // Drawn character by character from whatever has the glyph, not from one face.
+        ShapedScript::LastResort => return None,
     };
     cache
         .get_or_init(|| {
@@ -122,36 +137,43 @@ pub fn shape_latin(text: &str) -> Result<Vec<ShapedCluster>, GlyphError> {
     shape_script(text, false, ShapedScript::Latin)
 }
 
-/// Whether the Korean document face has a glyph for `c` (false without the face).
-pub fn korean_has(c: char) -> bool {
-    face(ShapedScript::Korean).is_some_and(|(font, _)| font.charmap().map(c).is_some_and(|g| g.to_u32() != 0))
-}
-
-/// Whether the Japanese document face has a glyph for `c` (false without the face).
-pub fn japanese_has(c: char) -> bool {
-    face(ShapedScript::Japanese).is_some_and(|(font, _)| font.charmap().map(c).is_some_and(|g| g.to_u32() != 0))
-}
-
 /// Hangul: the jamo, compatibility jamo, extended jamo and the precomposed syllables.
 pub fn is_hangul(c: char) -> bool {
-    matches!(u32::from(c), 0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xAC00..=0xD7AF | 0xD7B0..=0xD7FF)
+    matches!(u32::from(c), 0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xAC00..=0xD7FF)
 }
 
-/// Kana, CJK ideographs, CJK punctuation and the full-width forms.
+/// The shared Chinese, Japanese and Korean blocks other than Hangul: radicals, CJK symbols and
+/// punctuation, kana, Han ideographs and the full-width forms.
 pub fn is_cjk(c: char) -> bool {
-    matches!(u32::from(c), 0x3000..=0x30FF | 0x31F0..=0x31FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF)
+    matches!(u32::from(c), 0x2E80..=0x2FDF | 0x3000..=0x30FF | 0x31F0..=0x31FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF)
 }
 
-/// The face that draws `c` when the standard fonts (WinAnsiEncoding) and the bundled Inter face
-/// can't: the Korean face for Hangul, the Japanese face (else the Korean one) for kana and Han,
-/// and for anything else (circled numbers, arrows, shapes) whichever of the two has it. `None`
-/// when neither has it, or when the standard fonts or Inter already draw it.
-pub fn cjk_fallback(c: char) -> Option<ShapedScript> {
+/// Whether the build's face for `script` has a glyph for `c` (false without the face).
+fn script_has(script: ShapedScript, c: char) -> bool {
+    face(script).is_some_and(|(font, _)| font.charmap().map(c).is_some_and(|glyph| glyph.to_u32() != 0))
+}
+
+/// Whether the Korean (Gothic) document face has a glyph for `c` (false without the face).
+pub fn korean_has(c: char) -> bool {
+    script_has(ShapedScript::Korean { serif: false }, c)
+}
+
+/// Whether the Japanese (Gothic) document face has a glyph for `c` (false without the face).
+pub fn japanese_has(c: char) -> bool {
+    script_has(ShapedScript::Japanese { serif: false }, c)
+}
+
+/// The Korean or Japanese face that draws `c` when the standard fonts (WinAnsiEncoding) and the
+/// bundled Inter face can't, in the Myeongjo or Mincho kind for `serif` text: the Korean face for
+/// Hangul, the Japanese face (else the Korean one) for kana and Han, and for anything else
+/// (circled numbers, arrows, shapes) whichever of the two has it. `None` when neither has it, or
+/// when the standard fonts, Inter or the Thai face already draw it.
+pub fn cjk_script(c: char, serif: bool) -> Option<ShapedScript> {
     if matches!(c, '\n' | '\r' | '\t') || crate::win_ansi_encodable(c) || latin_has(c) || crate::shaped_text::is_thai(c) {
         return None;
     }
-    let korean = || korean_has(c).then_some(ShapedScript::Korean);
-    let japanese = || japanese_has(c).then_some(ShapedScript::Japanese);
+    let korean = || Some(ShapedScript::Korean { serif }).filter(|script| script_has(*script, c));
+    let japanese = || Some(ShapedScript::Japanese { serif }).filter(|script| script_has(*script, c));
     if is_hangul(c) {
         korean()
     } else if is_cjk(c) {
@@ -161,15 +183,27 @@ pub fn cjk_fallback(c: char) -> Option<ShapedScript> {
     }
 }
 
-/// Shape a run of Korean text (Hangul, and what [`cjk_fallback`] gives the Korean face) with the
-/// Korean document face. [`GlyphError::NoFont`] without the face.
-pub fn shape_korean(text: &str) -> Result<Vec<ShapedCluster>, GlyphError> {
-    shape_script(text, false, ShapedScript::Korean)
+/// [`cjk_script`] for text that isn't serif: the Gothic faces.
+pub fn cjk_fallback(c: char) -> Option<ShapedScript> {
+    cjk_script(c, false)
 }
 
-/// Shape a run of kana and Han with the Japanese document face.
+/// Shape a left-to-right run of Korean or Japanese `text` with the face of `script` (one
+/// [`cjk_script`] gave). [`GlyphError::NoFont`] without the face; [`GlyphError::Missing`] when it
+/// lacks a character.
+pub fn shape_cjk(text: &str, script: ShapedScript) -> Result<Vec<ShapedCluster>, GlyphError> {
+    shape_script(text, false, script)
+}
+
+/// Shape a run of Korean text (Hangul, and what [`cjk_fallback`] gives the Korean face) with the
+/// Gothic Korean document face. [`GlyphError::NoFont`] without the face.
+pub fn shape_korean(text: &str) -> Result<Vec<ShapedCluster>, GlyphError> {
+    shape_cjk(text, ShapedScript::Korean { serif: false })
+}
+
+/// Shape a run of kana and Han with the Gothic Japanese document face.
 pub fn shape_japanese(text: &str) -> Result<Vec<ShapedCluster>, GlyphError> {
-    shape_script(text, false, ShapedScript::Japanese)
+    shape_cjk(text, ShapedScript::Japanese { serif: false })
 }
 
 /// The scripts the bundled face's runs are shaped as.
@@ -208,15 +242,21 @@ fn shape_script(text: &str, rtl: bool, kind: ShapedScript) -> Result<Vec<ShapedC
             LatinRun::Cyrillic => script::CYRILLIC,
             LatinRun::Latin => script::LATIN,
         },
-        ShapedScript::Korean => script::HANGUL,
-        ShapedScript::Japanese => script::HAN,
+        ShapedScript::Korean { .. } => script::HANGUL,
+        ShapedScript::Japanese { .. } => script::HAN,
+        // It has no face, so `face` above already answered `NoFont`; nothing is shaped as it.
+        ShapedScript::LastResort => script::COMMON,
     });
-    // Preserve the historical Arabic per-character mapping; Hebrew, Thai and Latin marks stay with their base.
+    // Preserve the historical Arabic per-character mapping; Hebrew, Thai and Latin marks stay with
+    // their base, as do the conjoining jamo of a Hangul syllable.
     buffer.set_cluster_level(match kind {
         ShapedScript::Arabic => BufferClusterLevel::Characters,
-        ShapedScript::Hebrew | ShapedScript::Thai | ShapedScript::Latin | ShapedScript::Korean | ShapedScript::Japanese => {
-            BufferClusterLevel::MonotoneGraphemes
-        }
+        ShapedScript::Hebrew
+        | ShapedScript::Thai
+        | ShapedScript::Latin
+        | ShapedScript::Korean { .. }
+        | ShapedScript::Japanese { .. }
+        | ShapedScript::LastResort => BufferClusterLevel::MonotoneGraphemes,
     });
     let shaped = shaper.shape(buffer, ShapeOptions::new());
     // Clusters are byte offsets into `text`; a cluster shows the characters up to the next one.
@@ -256,6 +296,9 @@ pub fn arabic_glyph(id: u32) -> Result<GlyphOutline, GlyphError> {
 
 /// A bounded outline from the same face that produced the shaped glyph id.
 pub fn shaped_glyph(script: ShapedScript, id: u32) -> Result<GlyphOutline, GlyphError> {
+    if script == ShapedScript::LastResort {
+        return char::from_u32(id).map(crate::last_resort::outline).ok_or(GlyphError::Missing);
+    }
     let (font, _) = face(script).ok_or(GlyphError::NoFont)?;
     glyph(font, id)
 }

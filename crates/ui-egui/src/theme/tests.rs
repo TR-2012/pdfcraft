@@ -177,6 +177,7 @@ fn traditional_chinese_keeps_an_installed_face_when_hans_is_embedded() {
     assert_eq!(installed_fallback_need(CjkPreference::TraditionalChinese, true), Need::Hant);
     assert_eq!(installed_fallback_need(CjkPreference::TraditionalChinese, false), Need::Hant);
     assert_eq!(installed_fallback_need(CjkPreference::Default, true), Need::Other);
+    assert_eq!(installed_fallback_need(CjkPreference::Korean, true), Need::Other);
 }
 
 #[test]

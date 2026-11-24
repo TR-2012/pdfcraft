@@ -1665,6 +1665,81 @@ fn added_hebrew_text_is_drawn_right_to_left_and_stays_searchable() {
     assert!(mapped.contains("<05E905"), "{mapped}");
 }
 
+/// Korean and Japanese typed as new page text are drawn from the craft-fonts faces and read back
+/// as typed. They used to be refused ("only Western European characters can be added as text"),
+/// and a build without those faces still refuses them and writes nothing.
+#[test]
+fn added_korean_and_japanese_text_is_drawn_and_stays_searchable() {
+    let mut doc = fixture();
+    let text =
+        AddedText { rect: [72.0, 600.0, 400.0, 700.0], text: "한글 テスト 日本語 2026 PDF".into(), size: 14.0, ..AddedText::default() };
+    let has_korean_face = pdfcraft_fonts::document_korean_font().is_some();
+    let has_japanese_face = pdfcraft_fonts::document_japanese_font().is_some();
+    if !has_korean_face && !has_japanese_face {
+        eprintln!("skipping the Korean and Japanese drawing checks: built without those craft-fonts faces (set CRAFT_FONTS_DIR)");
+        assert_eq!(first_undrawable(&text), Some('한'));
+        let err = add_content(&mut doc, 0, &Content::Text(text)).unwrap_err();
+        assert!(matches!(&err, EditError::Invalid(m) if m.contains("U+D55C")), "{err:?}");
+        assert!(!doc.is_modified(), "nothing is written when the fonts are missing");
+        return;
+    }
+    if !(has_korean_face && has_japanese_face) {
+        eprintln!("skipping the Korean and Japanese drawing checks: the craft-fonts checkout has only one of the two faces");
+        return;
+    }
+    assert_eq!(first_undrawable(&text), None);
+    add_content(&mut doc, 0, &Content::Text(text.clone())).unwrap();
+    let doc = reopen(&doc);
+    let added = list_added(&doc);
+    let Content::Text(t) = &added[0].content else { panic!() };
+    assert_eq!(t.text, text.text, "the typed text is kept for editing");
+    let s = streams(&doc, 0);
+    let item = s.iter().find(|s| s.contains("/ActualText")).unwrap();
+    // Latin text and digits stay in the item's standard font; copy and search get the line back.
+    assert!(item.contains("2026 PDF) Tj"), "{item}");
+    let typed: String = t.text.encode_utf16().map(|u| format!("{u:04X}")).collect();
+    assert!(item.contains(&format!("/ActualText <FEFF{typed}>")), "{item}");
+    // The glyphs come from Type 3 fonts whose ToUnicode maps give each character back.
+    let p = &pdfcraft_model::pages(&doc)[0];
+    let res = doc.resolve(p.dict.get(b"Resources").unwrap());
+    let fonts = doc.resolve(res.as_dict().unwrap().get(b"Font").unwrap()).as_dict().unwrap().clone();
+    let shaped: Vec<_> = fonts.iter().filter(|(k, _)| k.starts_with(b"PCAr")).map(|(_, v)| doc.resolve(v).as_dict().unwrap().clone()).collect();
+    let mut mapped = String::new();
+    for f in &shaped {
+        assert_eq!(f.name(b"Subtype"), Some(&b"Type3"[..]));
+        mapped += &String::from_utf8_lossy(&stream_bytes(&doc, f.get(b"ToUnicode").unwrap()).unwrap());
+    }
+    // 한 글 テ ス ト 日 本 語
+    for character in ["D55C", "AE00", "30C6", "30B9", "30C8", "65E5", "672C", "8A9E"] {
+        assert!(mapped.contains(&format!("<{character}>")), "{character} in {mapped}");
+    }
+}
+
+/// Korean and Japanese have no spaces between words, so a line too long for its box wraps between
+/// characters instead of running past the box's edge. A closing mark never starts a row.
+#[test]
+fn added_korean_and_japanese_text_wraps_between_characters() {
+    if pdfcraft_fonts::document_korean_font().is_none() || pdfcraft_fonts::document_japanese_font().is_none() {
+        eprintln!("skipping the Korean and Japanese wrapping checks: built without those craft-fonts faces (set CRAFT_FONTS_DIR)");
+        return;
+    }
+    let size = 12.0;
+    let box_width = size * 5.5;
+    for typed in ["가나다라마바사아자차카타파하", "これはとてもながいぶんしょうです。", "日本語の文章、한국어 문장。"]
+    {
+        let item = AddedText { rect: [72.0, 600.0, 72.0 + box_width, 700.0], text: typed.into(), size, ..AddedText::default() };
+        let rows = crate::added::lines(&item);
+        assert!(rows.len() > 1, "{typed}: wrapped into {rows:?}");
+        assert_eq!(rows.concat().replace(' ', ""), typed.replace(' ', ""), "no character is lost or repeated");
+        for row in &rows {
+            // Full-width characters are one em wide: at most five fit, plus punctuation that hangs.
+            let wide = row.chars().filter(|c| !"、。 ".contains(*c)).count();
+            assert!(wide <= 5, "{typed}: row {row:?} is too long for the box");
+            assert!(!row.starts_with(['、', '。']), "{typed}: row {row:?} starts with a closing mark");
+        }
+    }
+}
+
 #[test]
 fn odd_hebrew_text_never_panics() {
     let mut doc = fixture();
@@ -1997,6 +2072,34 @@ fn japanese_line_uses_unicode_type3_fallback() {
     assert!(content.contains("/PCJp"), "{content}");
     let reopened = reopen(&doc);
     assert_eq!(text::text_lines(&reopened, 0).unwrap()[0].text, replacement);
+}
+
+/// Korean replacement text is drawn from the Korean craft-fonts face (NanumGothic) as a Type 3
+/// fallback and reads back as typed. Before, no face had Hangul and the edit was refused. A
+/// character that face lacks comes from the next face that has it, so Korean and Japanese can
+/// share a line.
+#[test]
+fn korean_line_uses_unicode_type3_fallback() {
+    let Some(korean_face) = pdfcraft_fonts::document_korean_font() else {
+        eprintln!("skipping korean_line_uses_unicode_type3_fallback: no Korean craft-fonts face (set CRAFT_FONTS_DIR to run it)");
+        return;
+    };
+    let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
+    let replacement = "안녕하세요, 한글 PDF 편집 2025";
+    let result = text::replace_line(&mut doc, 0, 0, replacement).unwrap();
+    assert_eq!(result.substituted, Some(format!("{} Type3", korean_face.family)));
+    let bytes = page_content_bytes(&doc, 0);
+    let content = String::from_utf8_lossy(&bytes);
+    assert!(content.contains("/PCKo"), "{content}");
+    assert_eq!(text::text_lines(&reopen(&doc), 0).unwrap()[0].text, replacement);
+
+    if pdfcraft_fonts::document_japanese_font().is_none() {
+        return;
+    }
+    let mut mixed = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
+    let korean_and_japanese = "한국어と日本語のテスト";
+    text::replace_line(&mut mixed, 0, 0, korean_and_japanese).unwrap();
+    assert_eq!(text::text_lines(&reopen(&mixed), 0).unwrap()[0].text, korean_and_japanese);
 }
 
 fn styled_text_page(base: &str) -> Document {
@@ -3218,12 +3321,17 @@ fn editor_background_removes_glyphs_but_preserves_following_text_advance() {
     }
 }
 
+/// Text used as a clipping path stays in the editor's background: without its glyphs the artwork
+/// behind them would flood its rectangle under the editor (#3429).
 #[test]
-fn editor_background_refuses_clipping_text_without_mutation() {
+fn editor_background_leaves_clipping_text_in_place() {
     let mut doc = text_page("BT /F1 12 Tf 7 Tr 72 700 Td (Clip) Tj ET");
-    let before = page_content_bytes(&doc, 0);
-    assert!(text::clear_block(&mut doc, 0, 0).is_err());
-    assert_eq!(page_content_bytes(&doc, 0), before);
+    text::clear_block(&mut doc, 0, 0).unwrap();
+    let lines = text::text_lines(&doc, 0).unwrap();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].text, "Clip", "the mask is still drawn");
+    let ops = pdfcraft_content::parse(&page_content_bytes(&doc, 0)).ops;
+    assert!(ops.iter().any(|o| o.is("Tr")) && ops.iter().any(|o| o.is("Tj")), "in its clipping mode");
 }
 
 #[test]
@@ -9083,7 +9191,7 @@ fn turned_paragraph_keeps_its_line_breaks_when_a_word_is_added() {
     text::rewrite_block(&mut doc, 0, 0, Some("Only line with several more words added"), &text::BlockStyle::default()).unwrap();
     let blocks = text::text_blocks(&reopen(&doc), 0).unwrap();
     assert_eq!(blocks[0].editor_text, "Only line with several more words added");
-    // Formatting part of turned text isn't laid out yet: refused, not drawn along the page's x axis.
+    // Formatting part of turned text is laid out along its own baseline, not the page's x axis.
     let mut doc = text_page("BT /F1 12 Tf 0 1 -1 0 300 300 Tm (Only line) Tj ET");
     let range = text::RangeStyle {
         range: 0..4,
@@ -9096,7 +9204,10 @@ fn turned_paragraph_keeps_its_line_breaks_when_a_word_is_added() {
         scale: None,
     };
     let style = text::BlockStyle { ranges: vec![range], ..Default::default() };
-    assert!(text::rewrite_block(&mut doc, 0, 0, Some("Only line"), &style).is_err());
+    text::rewrite_block(&mut doc, 0, 0, Some("Only line"), &style).unwrap();
+    let lines = text::text_lines(&reopen(&doc), 0).unwrap();
+    assert!(lines.iter().all(|l| (l.rotation() - 90.0).abs() < 0.5), "still turned: {:?}", lines.iter().map(TextLine::rotation).collect::<Vec<_>>());
+    assert!(lines.iter().any(|l| (l.size - 20.0).abs() < 0.01) && lines.iter().any(|l| (l.size - 12.0).abs() < 0.01), "one part enlarged");
 }
 
 /// A paragraph drawn at a slant rewraps at the width its rows have along their baseline, as the
@@ -9470,6 +9581,235 @@ fn a_new_character_comes_from_the_source_fonts_own_embedded_program() {
             "{to}: the source program draws it"
         );
     }
+}
+
+/// A font chosen for a paragraph draws what it holds, and a character it lacks is drawn by a
+/// fallback face instead of refusing the whole edit ("the selected font resource … cannot show").
+#[test]
+fn a_chosen_font_that_lacks_a_character_falls_back_instead_of_refusing() {
+    let inter = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+    let resource = text::register_text_font(&mut doc, 0, inter).unwrap();
+    let style = text::BlockStyle { width: Some(400.0), resource: Some(resource), ..Default::default() };
+    // Inter has no Hangul.
+    let typed = "Name 한글";
+    let edit = text::rewrite_block(&mut doc, 0, 0, Some(typed), &style);
+    if pdfcraft_fonts::document_korean_font().is_none() {
+        eprintln!("built without a Korean craft-fonts face (CRAFT_FONTS_DIR unset): the refusal names that face");
+        let refusal = edit.unwrap_err().to_string();
+        assert!(refusal.contains("Korean fallback font") && !refusal.contains("selected font resource"), "{refusal}");
+        return;
+    }
+    edit.unwrap();
+    assert_eq!(text::text_blocks(&reopen(&doc), 0).unwrap()[0].editor_text, typed);
+}
+
+/// A character no fallback face draws is taken from a font already on the page (one the person
+/// loaded there) before the edit is refused. Without such a font the edit is still refused.
+#[test]
+fn a_character_no_fallback_face_has_is_taken_from_a_font_on_the_page() {
+    let mono = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
+    // A character JetBrains Mono has that an edit on a page without it is refused for: a Powerline
+    // arrow, a box-drawing line or a Braille pattern, whichever the fallback faces of this build
+    // leave out. Found by trying the edit, since which faces stand in depends on the build input.
+    let refused_without_a_page_font = |c: &char| {
+        let mut bare = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+        pdfcraft_fonts::embedding::covers(mono, &c.to_string())
+            && text::rewrite_block(&mut bare, 0, 0, Some(&format!("Branch {c} main")), &text::BlockStyle::default()).is_err()
+    };
+    let candidates = ('\u{E0A0}'..='\u{E0B3}').chain('\u{2500}'..='\u{259F}').chain('\u{2800}'..='\u{28FF}');
+    let Some(rare) = candidates.into_iter().find(refused_without_a_page_font) else {
+        eprintln!("skipping: the fallback faces of this build draw every candidate character");
+        return;
+    };
+    let typed = format!("Branch {rare} main");
+    let typed = typed.as_str();
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+    text::register_text_font(&mut doc, 0, mono).unwrap();
+    text::rewrite_block(&mut doc, 0, 0, Some(typed), &text::BlockStyle::default()).unwrap();
+    assert_eq!(text::text_blocks(&reopen(&doc), 0).unwrap()[0].editor_text, typed);
+}
+
+/// Edits as a build that accepts any document font does, until dropped: a character nothing has
+/// a glyph for is drawn (from an installed face in such a build, else as a placeholder).
+struct DrawsUndrawable;
+
+impl DrawsUndrawable {
+    fn on() -> Self {
+        text::DRAWS_UNDRAWABLE.with(|draws| draws.set(true));
+        Self
+    }
+}
+
+impl Drop for DrawsUndrawable {
+    fn drop(&mut self) {
+        text::DRAWS_UNDRAWABLE.with(|draws| draws.set(false));
+    }
+}
+
+/// U+0378 is unassigned, so no bundled, page or installed font has a glyph for it.
+const UNASSIGNED: char = '\u{0378}';
+
+/// A character no font has is refused, except in a build that draws a box for it: there the edit
+/// goes through and the character stays in the text. One row takes the single-style rewrite, a
+/// line break the styled one.
+#[test]
+fn a_character_no_font_has_is_refused_unless_the_build_draws_a_box_for_it() {
+    for typed in [format!("Stable {UNASSIGNED} text"), format!("Stable\n{UNASSIGNED} text")] {
+        let edit = |doc: &mut Document| text::rewrite_block(doc, 0, 0, Some(&typed), &text::BlockStyle::default());
+        if !pdfcraft_fonts::embedding::accepts_any_document_font() {
+            let mut refused = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+            assert!(edit(&mut refused).is_err(), "{typed:?} is refused where nothing draws it");
+        }
+        let _draws = DrawsUndrawable::on();
+        let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+        edit(&mut doc).unwrap();
+        let read_back: String = text::text_blocks(&reopen(&doc), 0).unwrap().iter().map(|block| block.editor_text.clone()).collect();
+        assert!(read_back.contains(UNASSIGNED), "the character stays in the text: {read_back:?}");
+    }
+}
+
+/// A tab, a zero-width space and a control character have no glyph in any font. In a build that
+/// draws what it has no glyph for they take up their room (or none) instead of failing the edit,
+/// and the letters around them are all still there.
+#[test]
+fn a_tab_and_characters_that_are_never_seen_do_not_refuse_an_edit() {
+    let typed = "A\tB\u{200B}C\u{0007}D\nE";
+    let _draws = DrawsUndrawable::on();
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+    text::rewrite_block(&mut doc, 0, 0, Some(typed), &text::BlockStyle::default()).unwrap();
+    let letters: String =
+        text::text_blocks(&reopen(&doc), 0).unwrap().iter().flat_map(|block| block.editor_text.chars()).filter(char::is_ascii_alphabetic).collect();
+    assert_eq!(letters, "ABCDE");
+}
+
+/// A no-break space is in WinAnsi, but the standard font that stands in for the paragraph's font
+/// has no code for it. It takes a fallback glyph instead of failing when the row is written.
+#[test]
+fn a_no_break_space_the_standard_fonts_lack_takes_a_fallback_glyph() {
+    let typed = "Ten\u{00A0}pounds\nsterling";
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+    text::rewrite_block(&mut doc, 0, 0, Some(typed), &text::BlockStyle::default()).unwrap();
+    let read_back: String = text::text_blocks(&reopen(&doc), 0).unwrap().iter().map(|block| block.editor_text.clone()).collect();
+    assert!(read_back.contains("Ten") && read_back.contains("pounds") && read_back.contains("sterling"), "{read_back:?}");
+}
+
+/// Text that needs shaping (here Thai with a tone mark and a vowel sign) in a paragraph whose font
+/// cannot shape it is refused, except in a build that draws what it has no glyph for: there each
+/// character is written on its own, unshaped.
+#[test]
+fn text_no_font_can_shape_is_written_unshaped_where_the_build_draws_it() {
+    let typed = "Stable \u{0E19}\u{0E49}\u{0E33} text";
+    let _draws = DrawsUndrawable::on();
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+    text::rewrite_block(&mut doc, 0, 0, Some(typed), &text::BlockStyle::default()).unwrap();
+    let read_back: String = text::text_blocks(&reopen(&doc), 0).unwrap().iter().map(|block| block.editor_text.clone()).collect();
+    assert!(read_back.contains('\u{0E19}') && read_back.contains("Stable") && read_back.contains("text"), "{read_back:?}");
+}
+
+/// A paragraph the styled rewrite draws (here: one with a line break) is justified like any
+/// other: every row but the last ends at the paragraph's right edge, and the last is left as set.
+#[test]
+fn a_paragraph_with_a_line_break_is_justified_row_by_row() {
+    let draft = "aa bb cc dd ee ff gg hh ii jj kk ll\nmm nn";
+    let (left, width) = (72.0, 90.0);
+    let style = text::BlockStyle { width: Some(width), align: Some(added::Align::Justify), ..Default::default() };
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+    text::rewrite_block(&mut doc, 0, 0, Some(draft), &style).unwrap();
+    let lines = text::text_lines(&reopen(&doc), 0).unwrap();
+    let right_edge_of_row = |top: f64| lines.iter().filter(|l| (l.rect[3] - top).abs() < 1.0).map(|l| l.rect[2]).fold(f64::NEG_INFINITY, f64::max);
+    let first_row = lines.iter().map(|l| l.rect[3]).fold(f64::NEG_INFINITY, f64::max);
+    let last_row = lines.iter().map(|l| l.rect[3]).fold(f64::INFINITY, f64::min);
+    assert!(first_row - last_row > 12.0, "the text wrapped into rows");
+    assert!(
+        (right_edge_of_row(first_row) - (left + width)).abs() < 1.0,
+        "the first row fills the width: it ends at {}",
+        right_edge_of_row(first_row)
+    );
+    assert!(right_edge_of_row(last_row) < left + width - 20.0, "the last row is not stretched: it ends at {}", right_edge_of_row(last_row));
+    let words: Vec<String> =
+        text::text_blocks(&reopen(&doc), 0).unwrap().iter().flat_map(|b| b.text.split_whitespace().map(str::to_owned).collect::<Vec<_>>()).collect();
+    assert_eq!(words.join(" "), draft.replace('\n', " "), "every word is still there, in order");
+}
+
+/// A range's own colour, and nothing else.
+fn coloured(range: std::ops::Range<usize>, color: [f64; 3]) -> RangeStyle {
+    RangeStyle { range, family: None, resource: None, size: None, color: Some(color), underline: None, char_spacing: None, scale: None }
+}
+
+/// Part of a paragraph turned on the page takes its own formatting. Its pieces still run along
+/// the paragraph's baseline, one after another up the page, and read back as the same text.
+#[test]
+fn part_of_turned_text_takes_its_own_formatting() {
+    // A quarter turn: the text runs up the page from (300, 200).
+    let mut doc = text_page("BT /F1 12 Tf 0 1 -1 0 300 200 Tm (Turned words here) Tj ET");
+    let red = [1.0, 0.0, 0.0];
+    let style = text::BlockStyle { ranges: vec![coloured(7..12, red)], ..Default::default() };
+    text::rewrite_block(&mut doc, 0, 0, Some("Turned words here"), &style).unwrap();
+    let doc = reopen(&doc);
+    let read_back: Vec<String> = text::text_blocks(&doc, 0).unwrap().iter().map(|b| b.text.clone()).collect();
+    assert_eq!(read_back.join(" "), "Turned words here");
+    let lines = text::text_lines(&doc, 0).unwrap();
+    assert!(
+        lines.iter().all(|l| (l.rotation() - 90.0).abs() < 0.5),
+        "every piece is still turned: {:?}",
+        lines.iter().map(TextLine::rotation).collect::<Vec<_>>()
+    );
+    assert!(
+        lines.iter().all(|l| (l.baseline()[0] - 300.0).abs() < 0.5),
+        "on the one baseline: {:?}",
+        lines.iter().map(TextLine::baseline).collect::<Vec<_>>()
+    );
+    let words = lines.iter().find(|l| l.text.contains("words")).unwrap();
+    assert_eq!(words.color, red, "the range took its colour");
+    assert!(lines.iter().filter(|l| !l.text.contains("words")).all(|l| l.color != red), "and the rest kept theirs");
+    let starts: Vec<f64> = ["Turned", "words", "here"].iter().map(|w| lines.iter().find(|l| l.text.contains(w)).unwrap().baseline()[1]).collect();
+    assert!(starts[0] < starts[1] && starts[1] < starts[2], "the words follow each other up the page: {starts:?}");
+}
+
+/// Part of right-to-left text takes its own formatting: the row is written in drawing order,
+/// each character keeping its style, and reads back in typing order.
+#[test]
+fn part_of_hebrew_text_takes_its_own_formatting() {
+    if pdfcraft_fonts::document_hebrew_font(false).is_none() {
+        eprintln!("skipping: built without a craft-fonts Hebrew face (set CRAFT_FONTS_DIR)");
+        return;
+    }
+    let typed = "\u{05E9}\u{05DC}\u{05D5}\u{05DD} \u{05E2}\u{05D5}\u{05DC}\u{05DD}";
+    let blue = [0.0, 0.0, 1.0];
+    // The first word: four letters of two bytes each.
+    let style = text::BlockStyle { ranges: vec![coloured(0..8, blue)], ..Default::default() };
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Stable text) Tj ET");
+    text::rewrite_block(&mut doc, 0, 0, Some(typed), &style).unwrap();
+    let doc = reopen(&doc);
+    let lines = text::text_lines(&doc, 0).unwrap();
+    let first_word = lines.iter().find(|l| l.color == blue).expect("the range took its colour");
+    let second_word = lines.iter().find(|l| l.color != blue && !l.text.trim().is_empty()).expect("the rest kept its colour");
+    assert!(first_word.rect[0] > second_word.rect[0], "the first word typed is drawn on the right: {:?} {:?}", first_word.rect, second_word.rect);
+    let read_back: String = text::text_blocks(&doc, 0).unwrap().iter().map(|b| b.text.clone()).collect::<Vec<_>>().join(" ");
+    assert_eq!(read_back, typed, "it reads back in typing order");
+}
+
+/// Added text with characters no face draws (Armenian, an unassigned code point), with marks
+/// that need shaping and with right-to-left letters is refused, except where the build has the
+/// last resort: there it is drawn and its typed text is kept for editing.
+#[test]
+fn added_text_no_face_draws_is_drawn_where_the_build_has_the_last_resort() {
+    let typed = format!("Caf\u{e9} \u{0540}\u{0561}\u{0575} {UNASSIGNED}\n\u{0E19}\u{0E49}\u{0E33} \u{05E9}\u{05B8}\u{05DC}");
+    let text = AddedText { rect: [72.0, 600.0, 300.0, 700.0], text: typed.clone(), ..AddedText::default() };
+    if !pdfcraft_fonts::embedding::accepts_any_document_font() {
+        assert!(first_undrawable(&text).is_some());
+        assert!(add_content(&mut fixture(), 0, &Content::Text(text.clone())).is_err());
+    }
+    let _draws = DrawsUndrawable::on();
+    assert_eq!(first_undrawable(&text), None);
+    let mut doc = fixture();
+    add_content(&mut doc, 0, &Content::Text(text)).unwrap();
+    let doc = reopen(&doc);
+    let added = list_added(&doc);
+    let Content::Text(kept) = &added[0].content else { panic!() };
+    assert_eq!(kept.text, typed, "the typed text is kept for editing");
+    assert!(streams(&doc, 0).iter().any(|stream| stream.contains("/ActualText")), "it is drawn as shaped text, with its text for copy and search");
 }
 
 #[test]
@@ -10171,10 +10511,12 @@ fn clipping_text_page(mode: i64) -> Document {
 
 /// Rewriting text that is a clipping path destroyed the artwork it masked: the glyphs went, the
 /// mask with them, and the fill behind flooded its own rectangle, in a file that still opened
-/// without a warning (#3429). Photoshop exports draw every text object this way. The rewrite is
-/// refused instead, as `clear_block` already refuses a preview.
+/// without a warning (#3429). Photoshop exports draw every text object this way. Replacing one
+/// line of it is refused. Rewriting the paragraph writes the new text back as the mask: one text
+/// object in the same rendering mode, with no `q`/`Q` of its own around it, so the fill after it
+/// is still painted through its glyphs.
 #[test]
-fn rewriting_clipping_path_text_is_refused_for_every_clipping_mode() {
+fn rewriting_clipping_path_text_keeps_it_the_mask_in_every_clipping_mode() {
     for mode in [4, 5, 6, 7] {
         let before = text::text_lines(&clipping_text_page(mode), 0).unwrap();
         assert_eq!(before.len(), 1, "mode {mode}: the mask is one line");
@@ -10182,16 +10524,32 @@ fn rewriting_clipping_path_text_is_refused_for_every_clipping_mode() {
         let mut doc = clipping_text_page(mode);
         let line = text::replace_line(&mut doc, 0, 0, "EDITED");
         assert!(matches!(&line, Err(EditError::Invalid(m)) if m.contains("clipping path")), "mode {mode}: {line:?}");
+        assert_eq!(text::text_lines(&doc, 0).unwrap()[0].text, "MASK", "mode {mode}: refused means untouched");
 
         let mut doc = clipping_text_page(mode);
-        let block = text::rewrite_block(&mut doc, 0, 0, Some("EDITED"), &BlockStyle::default());
-        assert!(matches!(&block, Err(EditError::Invalid(m)) if m.contains("clipping path")), "mode {mode}: {block:?}");
-
-        // Refused means untouched: the mask is still there to shape what is painted through it.
-        let after = text::text_lines(&doc, 0).unwrap();
+        text::rewrite_block(&mut doc, 0, 0, Some("EDITED"), &BlockStyle::default()).unwrap();
+        let after = text::text_lines(&reopen(&doc), 0).unwrap();
         assert_eq!(after.len(), 1, "mode {mode}");
-        assert_eq!(after[0].text, "MASK", "mode {mode}");
+        assert_eq!(after[0].text, "EDITED", "mode {mode}: the new text is the mask");
+        let ops = pdfcraft_content::parse(&page_content_bytes(&doc, 0)).ops;
+        let shown = ops.iter().position(|o| o.is("Tj")).unwrap();
+        let fill = ops.iter().position(|o| o.is("re")).unwrap();
+        let mode_set = ops[..shown].iter().rev().find(|o| o.is("Tr")).and_then(|o| o.operands.first().and_then(Object::as_int));
+        assert_eq!(mode_set, Some(mode), "mode {mode}: the text is shown in the mask's own rendering mode");
+        assert!(shown < fill && !ops[shown..fill].iter().any(|o| o.is("Q")), "mode {mode}: the mask is still in force where the fill is painted");
     }
+}
+
+/// A mask can take only what its own font or a standard font draws: a generated fallback font is
+/// painted whatever the rendering mode, so its glyphs would cover the artwork and mask nothing.
+/// Such text is refused and the mask is left as it was.
+#[test]
+fn a_mask_is_not_rewritten_with_characters_only_a_generated_font_draws() {
+    let _draws = DrawsUndrawable::on();
+    let mut doc = clipping_text_page(7);
+    let refused = text::rewrite_block(&mut doc, 0, 0, Some("MASK \u{0540}"), &BlockStyle::default());
+    assert!(matches!(&refused, Err(EditError::Invalid(m)) if m.contains("clipping path")), "{refused:?}");
+    assert_eq!(text::text_lines(&doc, 0).unwrap()[0].text, "MASK", "refused means untouched");
 }
 
 /// The modes that paint ink are still editable: only 4 to 7 add to the clip path.
@@ -12783,16 +13141,20 @@ fn ordinary_soft_wrap_counts_keep_their_spaces() {
     }
 }
 
+/// A paragraph of several styles is justified by the styled rewrite, not left aligned in
+/// silence and no longer refused: it is rewritten, and every word of it is still there.
 #[test]
-fn styled_existing_justification_is_refused_instead_of_silently_left_aligning() {
+fn styled_existing_justification_rewrites_the_paragraph_and_keeps_its_words() {
     let mut doc = mixed_region_page();
     let before = page_content_bytes(&doc, 0);
     let blocks = text::text_blocks(&doc, 0).unwrap();
+    let words = |text: &str| text.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
     let style = text::BlockStyle { align: Some(added::Align::Justify), ..Default::default() };
-    let error = text::rewrite_block(&mut doc, 0, 1, Some(&blocks[1].editor_text), &style).unwrap_err();
-    assert!(error.to_string().contains("justification"));
-    assert_eq!(page_content_bytes(&doc, 0), before);
-    assert_eq!(page_content_bytes(&reopen(&doc), 0), before);
+    text::rewrite_block(&mut doc, 0, 1, Some(&blocks[1].editor_text), &style).unwrap();
+    assert_ne!(page_content_bytes(&doc, 0), before, "the paragraph was rewritten");
+    let after: Vec<String> = text::text_blocks(&reopen(&doc), 0).unwrap().iter().flat_map(|b| words(&b.text)).collect();
+    let expected: Vec<String> = blocks.iter().flat_map(|b| words(&b.text)).collect();
+    assert_eq!(after, expected);
 }
 
 /// Ungroup renames every kind of resource a content stream names, where the page already uses

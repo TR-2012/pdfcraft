@@ -1,5 +1,6 @@
 use super::layout::{
-    Piece, arabic_error, hebrew_error, is_arabic, is_hebrew, is_thai, latin_width, norm, shaped_layout, text_rect, thai_error, wrapped,
+    Piece, arabic_error, cjk_error, has_cjk, hebrew_error, is_arabic, is_hebrew, is_thai, latin_width, norm, shaped_layout, text_rect, thai_error,
+    wrapped,
 };
 use super::types::{AddedText, Align, Family, Ink};
 use super::{
@@ -37,7 +38,7 @@ fn placed(t: &AddedText, r: [f64; 4], paragraphs: &[usize], i: usize, w: f64, sp
     (x, tw)
 }
 
-/// Draw a text item that has Arabic, Hebrew or Thai in it. Each line is laid out in display order; their glyphs
+/// Draw a text item that has Arabic, Hebrew, Thai, Korean or Japanese in it. Each line is laid out in display order; their glyphs
 /// come from Type 3 fonts drawn from the craft-fonts face's outlines (no font file is embedded),
 /// with a ToUnicode map for copy and search. Other text uses the item's standard font.
 fn draw_shaped(doc: &mut Document, t: &AddedText, taken: &Dict, fonts: &mut Dict, out: &mut Vec<u8>) -> Result<(), EditError> {
@@ -70,7 +71,9 @@ pub(super) fn draw_laid_shaped(
             ShapedScript::Hebrew => hebrew_error(e, &c.text),
             ShapedScript::Thai => thai_error(e, &c.text),
             ShapedScript::Latin => EditError::Invalid(pdfcraft_fonts::shaped_text::latin_message(e, &c.text)),
-            ShapedScript::Korean | ShapedScript::Japanese => EditError::Invalid(pdfcraft_fonts::shaped_text::shaped_message(e, &c.text)),
+            ShapedScript::Korean { .. } | ShapedScript::Japanese { .. } => cjk_error(e, &c.text),
+            // Its outlines are made, not read from a face, so this is not reached.
+            ShapedScript::LastResort => EditError::Invalid(format!("\"{}\" can't be drawn", c.text)),
         })?;
     out.extend(format!("BT {}\n", t.fill_op()).bytes());
     if t.char_spacing != 0.0 {
@@ -134,11 +137,15 @@ pub(super) fn draw(doc: &mut Document, c: &Content, view: [f64; 6], taken: &Dict
             }
             let mut fonts = Dict::new();
             fonts.set(name.clone().into_bytes(), Object::Dict(font));
-            let face_or_new = |has: fn(char) -> bool, face: bool| t.text.chars().any(has) && (face || !existing);
+            // With the last resort, text of a script whose face the build lacks is laid out and
+            // drawn as shaped text too, whether the item is new or not.
+            let face_or_new =
+                |has: fn(char) -> bool, face: bool| t.text.chars().any(has) && (face || !existing || crate::text::draws_undrawable_characters());
             if t.text.chars().any(is_thai)
                 || t.text.chars().any(|c| pdfcraft_fonts::cjk_fallback(c).is_some())
                 || face_or_new(is_arabic, pdfcraft_fonts::document_arabic_font().is_some())
                 || face_or_new(is_hebrew, pdfcraft_fonts::document_hebrew_font(false).is_some())
+                || has_cjk(t)
             {
                 draw_shaped(doc, t, taken, &mut fonts, &mut out)?;
                 res.set(b"Font".to_vec(), Object::Dict(fonts));

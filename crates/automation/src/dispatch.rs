@@ -550,7 +550,7 @@ impl Automation {
                 } else {
                     pdfcraft_engine::text_fonts::installed_directories()
                 };
-                json!({"fonts": pdfcraft_engine::text_fonts::discover(&roots).into_iter().map(|f| json!({"path":f.path,"family":f.family,"font":f.face})).collect::<Vec<_>>()})
+                json!({"fonts": pdfcraft_engine::text_fonts::discover(&roots).into_iter().map(|f| json!({"path":f.path,"family":f.family,"font":f.face,"face":f.face_index})).collect::<Vec<_>>()})
             }
             "text_font_import" => {
                 let page = self.page(&a)?;
@@ -558,10 +558,16 @@ impl Automation {
                 let file = std::fs::File::open(&path).map_err(failed)?;
                 use std::io::Read;
                 let mut bytes = Vec::new();
-                file.take((16 << 20) + 1).read_to_end(&mut bytes).map_err(failed)?;
-                if bytes.len() > 16 << 20 {
-                    return Err(ToolError::InvalidArgs("font input exceeds 16 MiB".into()));
+                let most = pdfcraft_engine::text_fonts::MAX_FONT_FILE_BYTES;
+                file.take(most as u64 + 1).read_to_end(&mut bytes).map_err(failed)?;
+                if bytes.len() > most {
+                    return Err(ToolError::InvalidArgs("font input exceeds 64 MiB; choose a smaller font file".into()));
                 }
+                // The face asked for (the first by default) as a standalone, static program.
+                let face = a.get("face").map(|f| f.as_u64().and_then(|n| u32::try_from(n).ok())).unwrap_or(Some(0));
+                let face =
+                    face.ok_or_else(|| ToolError::InvalidArgs("face must be a whole number from 0 (the `face` text_font_files lists)".into()))?;
+                let bytes = pdfcraft_engine::text_fonts::standalone_face(&bytes, face).map_err(ToolError::InvalidArgs)?.into_owned();
                 let before: Vec<_> = self.doc(&a)?.text_editor_fonts(page).into_iter().map(|f| f.resource).collect();
                 let mut out = self.apply(&a, Edit::RegisterTextFont { page, bytes: Arc::new(bytes) })?;
                 let added = self

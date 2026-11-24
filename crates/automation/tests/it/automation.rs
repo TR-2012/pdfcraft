@@ -762,6 +762,26 @@ fn tool_schema_enums_have_one_json_type() {
     }
 }
 
+/// A font collection through the tools: text_font_files lists each face with its `face` number,
+/// and text_font_import loads the one asked for (the first by default).
+#[test]
+fn a_face_of_a_font_collection_loads_through_tools() {
+    let dir = workdir("font-collection");
+    let regular: &[u8] = include_bytes!("../../../../assets/fonts/Inter-Regular.ttf");
+    let medium: &[u8] = include_bytes!("../../../../assets/fonts/Inter-Medium.ttf");
+    std::fs::write(dir.join("inter.ttc"), pdfcraft_fonts::embedding::collection_of(&[regular, medium]).unwrap()).unwrap();
+    let mut a = auto(&dir);
+    let found = ok(&mut a, "text_font_files", json!({}));
+    let listed: Vec<(String, u64)> =
+        found["fonts"].as_array().unwrap().iter().map(|f| (f["font"].as_str().unwrap().to_string(), f["face"].as_u64().unwrap())).collect();
+    assert_eq!(listed, [("Inter-Medium".to_string(), 1), ("Inter-Regular".to_string(), 0)]);
+    let id = ok(&mut a, "doc_open", json!({"path":"a.pdf"}))["doc"].as_u64().unwrap();
+    assert_eq!(ok(&mut a, "text_font_import", json!({"doc":id,"page":1,"path":"inter.ttc","face":1}))["font"], "Inter-Medium");
+    assert_eq!(ok(&mut a, "text_font_import", json!({"doc":id,"page":1,"path":"inter.ttc"}))["font"], "Inter-Regular");
+    assert!(a.call("text_font_import", &json!({"doc":id,"page":1,"path":"inter.ttc","face":2})).is_err(), "there is no third face");
+    assert!(a.call("text_font_import", &json!({"doc":id,"page":1,"path":"inter.ttc","face":-1})).is_err());
+}
+
 #[test]
 fn explicit_font_and_disjoint_ranges_save_reopen_through_tools() {
     let dir = workdir("font-ranges");
@@ -5585,7 +5605,8 @@ fn creating_from_text_refuses_what_the_font_cannot_draw() {
     // WinAnsi characters, line breaks and tabs are still fine.
     let d = ok(&mut a, "doc_create", json!({ "from": "text", "text": "Price: 5 € at café\r\n\tnext\u{c}page two" }))["doc"].as_u64().unwrap();
     assert_eq!(page_text(&mut a, d).len(), 2);
-    // #959: page_add_text refuses it too.
+    // #959: page_add_text refuses it too, unless the build has a Korean craft-fonts face: then the
+    // text is drawn with that face and reads back as typed.
     let doc = ok(&mut a, "doc_create", json!({ "from": "blank" }))["doc"].as_u64().unwrap();
     refused(a.call("page_add_text", &json!({ "doc": doc, "page": 1, "text": "ABC ሰላም ፈተና", "at": [20, 20] })));
     let korean = a.call("page_add_text", &json!({ "doc": doc, "page": 1, "text": "ABC 제안서 시험", "at": [20, 20] }));

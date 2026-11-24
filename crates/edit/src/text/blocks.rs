@@ -107,14 +107,28 @@ impl TextBlock {
 /// Myers' diff costs O((N + M) · D), so bounding D keeps it linear.
 const MAX_CHANGED_WORDS: usize = 64;
 
-/// `text` split into words, each with the whitespace after it, as char ranges.
+/// Whether `ch` is a letter of a script written without spaces between words: kana, Han
+/// ideographs (with 々 and the compatibility block), half-width katakana, and Hangul syllables
+/// and compatibility jamo.
+fn is_cjk_letter(ch: char) -> bool {
+    matches!(
+        u32::from(ch),
+        0x3005 | 0x3040..=0x30FF | 0x3130..=0x318F | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFF66..=0xFF9F
+    )
+}
+
+/// `text` split into words, each with the whitespace after it, as char ranges. A word also ends
+/// where Chinese, Japanese or Korean letters meet anything else: those scripts put no space
+/// between a word and the bracket, digit or Latin text next to it. Without that, `表現（　　）` was
+/// one word, and filling in two brackets on a row made 表現 between them count as typed anew,
+/// which moved it from its own font to the brackets'.
 fn words(text: &[char]) -> Vec<std::ops::Range<usize>> {
     let mut out = Vec::new();
     let mut start = 0;
     for (i, pair) in text.windows(2).enumerate() {
         if let [a, b] = pair
-            && a.is_whitespace()
             && !b.is_whitespace()
+            && (a.is_whitespace() || is_cjk_letter(*a) != is_cjk_letter(*b))
         {
             out.push(start..i + 1);
             start = i + 1;
@@ -371,8 +385,10 @@ pub fn clear_block(doc: &mut Document, page: usize, block: usize) -> Result<(), 
     let shown = interpret(doc, &ops, &res, &mut HashMap::new(), &mut Carry::new(), None, None)?;
     let mut patches = HashMap::new();
     for s in shown.into_iter().filter(|s| drops.contains(&s.op)) {
+        // Text used as a clipping path stays in the preview: without its glyphs the artwork
+        // behind them would flood its whole rectangle under the editor (#3429).
         if s.state.render_mode >= 4 {
-            return Err(EditError::Invalid("text used as a clipping path cannot be previewed for editing".into()));
+            continue;
         }
         let denominator = s.state.size * s.state.scale;
         let adjustment = if denominator != 0.0 { -1000.0 * s.advance / denominator } else { 0.0 };

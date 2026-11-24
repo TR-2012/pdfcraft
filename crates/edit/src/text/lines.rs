@@ -59,6 +59,37 @@ impl TextLine {
     pub(crate) fn frame_rect(&self) -> [f64; 4] {
         self.frame
     }
+
+    /// The line as it lies in the frame of a baseline running in `dir`: its boxes and its start
+    /// turned into that frame, and its CTM followed by the same turn. A paragraph turned on the
+    /// page is upright there, which is how the styled rewrite lays rows out; the text matrices
+    /// that rewrite writes are the same either way, since the turn cancels where a CTM is undone.
+    pub(crate) fn in_frame(&self, dir: (f64, f64)) -> TextLine {
+        let turn = Matrix([dir.0, -dir.1, dir.1, dir.0, 0.0, 0.0]);
+        let own = self.direction();
+        let runs_along = (own.0 - dir.0).abs() < 1e-3 && (own.1 - dir.1).abs() < 1e-3;
+        let (x, baseline) = to_frame(dir, (self.origin.x, self.origin.baseline));
+        let mut line = self.clone();
+        // Its own tight box where it runs along `dir`; else the box around its box turned.
+        line.rect = if runs_along { self.frame } else { box_in_frame(dir, self.rect) };
+        line.ink = self.ink.iter().map(|ink| box_in_frame(dir, *ink)).collect();
+        line.origin.x = x;
+        line.origin.baseline = baseline;
+        line.origin.ctm = Matrix(self.origin.ctm).then(&turn).0;
+        line
+    }
+}
+
+/// The box around the user-space box `rect` once its corners are turned into the frame of `dir`.
+fn box_in_frame(dir: (f64, f64), rect: [f64; 4]) -> [f64; 4] {
+    let corners = [(rect[0], rect[1]), (rect[2], rect[1]), (rect[2], rect[3]), (rect[0], rect[3])].map(|corner| to_frame(dir, corner));
+    let along = corners.map(|(along, _)| along);
+    let across = corners.map(|(_, across)| across);
+    let (least, most) = (
+        |values: [f64; 4]| values.into_iter().fold(f64::INFINITY, f64::min),
+        |values: [f64; 4]| values.into_iter().fold(f64::NEG_INFINITY, f64::max),
+    );
+    [least(along), least(across), most(along), most(across)]
 }
 
 /// One entry of a page's `/Contents`, and what it decoded to.

@@ -66,6 +66,46 @@ fn japanese_ui_text_uses_craft_fonts() {
     }
 }
 
+/// Built with a Korean craft-fonts face (NanumGothic), Korean text renders with real glyphs in
+/// every family without any installed font, so it also works with `PDFCRAFT_SYSTEM_FONTS=0` and on
+/// a machine with no Korean font. A Korean interface puts that face before the Japanese ones, so a
+/// line's Hanja and CJK punctuation come from the same face as its Hangul.
+#[test]
+fn korean_ui_text_uses_craft_fonts() {
+    const KOREAN: &str = "한국어 글자 편집";
+    let korean: Vec<String> = pdfcraft_fonts::ui_korean_fonts().iter().map(|f| f.name()).collect();
+    if korean.is_empty() {
+        eprintln!("skipping korean_ui_text_uses_craft_fonts: no Korean face bundled (set CRAFT_FONTS_DIR to run it)");
+        return;
+    }
+    // `font_definitions` has the embedded faces only: no installed font is involved.
+    let mut fonts = Fonts::new(TextOptions::default(), theme::font_definitions());
+    for id in families() {
+        assert!(fonts.has_glyphs(&id, KOREAN), "{id:?} lacks {KOREAN}");
+    }
+    // Real glyphs are about a full em wide each; tofu boxes and missing glyphs are not.
+    let syllables = KOREAN.chars().filter(|c| !c.is_whitespace()).count();
+    for w in layout_widths(&mut fonts, KOREAN) {
+        assert!(w > 13.0 * 0.8 * syllables as f32, "{w}");
+    }
+
+    assert_eq!(theme::CjkPreference::for_language("ko"), theme::CjkPreference::Korean);
+    let japanese: Vec<String> = pdfcraft_fonts::ui_japanese_fonts().iter().map(|f| f.name()).collect();
+    let first = |stack: &[String], names: &[String]| stack.iter().position(|n| names.contains(n));
+    for (preference, korean_leads) in [(theme::CjkPreference::Korean, true), (theme::CjkPreference::Default, false)] {
+        let defs = theme::installed_font_definitions(preference);
+        for (family, stack) in &defs.families {
+            let at = first(stack, &korean).unwrap_or_else(|| panic!("{family:?} has no Korean face: {stack:?}"));
+            let own = stack.iter().position(|n| n.starts_with("Inter") || n == "JetBrainsMono").expect("the app's own font");
+            assert!(own < at, "{family:?}: {stack:?}");
+            assert_eq!(stack.iter().filter(|n| korean.contains(n)).count(), korean.len(), "{family:?}: each face once: {stack:?}");
+            if let Some(first_japanese) = first(stack, &japanese) {
+                assert_eq!(at < first_japanese, korean_leads, "{preference:?} {family:?}: {stack:?}");
+            }
+        }
+    }
+}
+
 /// Chinese mode orders the CJK fallback with the `Hans` group first, so one line never
 /// mixes faces with different vertical metrics. Without a `Hans` face in the build input the
 /// order part still holds; glyph coverage follows the craft-fonts checkout.

@@ -381,13 +381,24 @@ fn group_layout(lines: &[TextLine], mixed: bool) -> Vec<TextBlock> {
         // The run placed before this one in the row, tracked rather than searched for: rows
         // don't share runs, so it is the last one this loop pushed.
         let mut prev_in_row: Option<&TextLine> = None;
-        for &index in row {
+        // A right-to-left row reads from its right end. Each of its runs is in typing order
+        // already, so they are joined last to first: a row in several styles or fonts then reads
+        // as it was typed, rather than with its words in drawing order.
+        let row_as_drawn: String = row.iter().filter_map(|index| lines.get(*index)).map(|line| line.text.as_str()).collect();
+        let reads_leftwards = row.len() > 1 && crate::bidi::rtl_base(&row_as_drawn);
+        let in_reading_order: Vec<usize> = if reads_leftwards { row.iter().rev().copied().collect() } else { row.clone() };
+        for index in in_reading_order {
             let Some(line) = lines.get(index) else { continue };
+            // The room between this run and the one read before it, which is on its right in a
+            // row read leftwards.
+            let room = |prev: &TextLine| {
+                if reads_leftwards { prev.frame_rect()[0] - line.frame_rect()[2] } else { line.frame_rect()[0] - prev.frame_rect()[2] }
+            };
             // Some producers position separate words without encoding a space.
             if let Some(prev) = prev_in_row
                 && !row_text.ends_with(char::is_whitespace)
                 && !line.text.starts_with(char::is_whitespace)
-                && line.frame_rect()[0] - prev.frame_rect()[2] > line.size * 0.12
+                && room(prev) > line.size * 0.12
             {
                 row_text.push(' ');
                 block.editor_text.push(' ');

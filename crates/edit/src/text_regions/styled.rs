@@ -1,4 +1,5 @@
 use super::super::interp::TextState;
+use super::super::undrawable::{draws_undrawable_characters, installed_glyph, placeholder_glyph};
 use super::grouping::{across, is_centred, row_rect};
 use super::{
     BlockStyle, CraftFont, Dict, Document, EditError, HashMap, LineEdit, MAX_TYPE3_GLYPHS, Matrix, Metrics, Object, Op, PdfString, Pieces,
@@ -33,17 +34,19 @@ struct FontResolver<'a> {
     metrics: &'a mut std::collections::BTreeMap<String, Metrics>,
     full_faces: HashMap<String, String>,
     programs: HashMap<String, Option<std::sync::Arc<Vec<u8>>>>,
+    /// The standard fonts that may stand in for a source font, by resource name, measured once
+    /// each. One is added to the page only when it shows a character ([`Self::substitute_for`]).
+    substitutes: HashMap<String, Metrics>,
 }
 
 impl FontResolver<'_> {
     fn encodable_font(&mut self, source: &TextLine, text: &str, requested: Option<&str>) -> Result<Option<String>, EditError> {
-        if let Some(resource) = requested {
-            if !self.metrics.get(resource).is_some_and(|metrics| source_encodes(metrics, text)) {
-                return Err(EditError::Invalid(format!(
-                    "the selected font resource {resource} cannot show U+{:04X}",
-                    text.chars().next().map_or(0, u32::from)
-                )));
-            }
+        // The font chosen for the text draws what it holds. A character it lacks goes on to the
+        // paragraph's own font and the fallback faces, as a character the paragraph's font lacks
+        // does, instead of refusing the whole edit.
+        if let Some(resource) = requested
+            && self.metrics.get(resource).is_some_and(|metrics| source_encodes(metrics, text))
+        {
             return Ok(Some(resource.to_owned()));
         }
         if self.metrics.get(&source.font).is_some_and(|metrics| source_encodes(metrics, text)) {
@@ -77,6 +80,19 @@ impl FontResolver<'_> {
         self.embed_face(key, &bytes, &family, "the source font could not be loaded").map(Some)
     }
 
+    /// A font already on the page that holds `text`, the first by resource name: a face the
+    /// person loaded there, or another font of the page. Only asked once no fallback face draws
+    /// the character, so that an edit is not refused while the page itself has a font for it.
+    /// The draft-only Thai names are aliases of other fonts and are passed over.
+    fn any_page_font(&self, text: &str) -> Option<String> {
+        const DRAFT_ONLY_PREFIXES: [&str; 2] = ["PCOutlineThai", "PCProgramThai"];
+        self.metrics
+            .iter()
+            .filter(|(name, _)| !DRAFT_ONLY_PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
+            .find(|(_, metrics)| source_encodes(metrics, text))
+            .map(|(name, _)| name.clone())
+    }
+
     fn embed_face(&mut self, key: String, bytes: &[u8], family: &str, missing_message: &str) -> Result<String, EditError> {
         if let Some(name) = self.full_faces.get(&key) {
             return Ok(name.clone());
@@ -89,7 +105,11 @@ impl FontResolver<'_> {
         Ok(name)
     }
 
-    fn substitute_font(&mut self, source: &TextLine) -> String {
+    /// The standard font that stands in for `source`, added to the page, when it shows `text`.
+    /// `None` for the few WinAnsi characters a standard font has no code for (the tab, the
+    /// no-break space, the soft hyphen): they go on to the fallback faces instead of failing
+    /// later, when the row is written.
+    fn substitute_for(&mut self, source: &TextLine, text: &str) -> Option<String> {
         let family = source_family(&source.base_font);
         let base = family.base_font(source.bold, source.italic);
         let name = format!("PCEd{}", base.replace('-', ""));
@@ -98,9 +118,13 @@ impl FontResolver<'_> {
         font.set(b"Subtype".to_vec(), Object::name("Type1"));
         font.set(b"BaseFont".to_vec(), Object::name(base));
         font.set(b"Encoding".to_vec(), Object::name("WinAnsiEncoding"));
-        self.metrics.entry(name.clone()).or_insert_with(|| Metrics::from_dict(self.doc, &font));
+        let measured = self.substitutes.entry(name.clone()).or_insert_with(|| Metrics::from_dict(self.doc, &font));
+        if !source_encodes(measured, text) {
+            return None;
+        }
+        self.metrics.entry(name.clone()).or_insert_with(|| measured.clone());
         self.fonts.set(name.clone().into_bytes(), Object::Dict(font));
-        name
+        Some(name)
     }
 }
 
@@ -139,6 +163,10 @@ struct ThaiShaping {
     /// Draft-only names whose rows, Latin ones included, are shaped and embedded with the
     /// complete program of this same-face resource: a span its subsets can't show in place.
     program: HashMap<String, String>,
+    /// The edit's rows are put in drawing order and drawn character by character
+    /// ([`rows_in_drawing_order`]), so their right-to-left runs are not shaped as well: a shaper
+    /// would turn them round a second time.
+    rows_in_drawing_order: bool,
 }
 
 /// How a Thai span keeps its source face ([`legacy_thai_font`]).
@@ -171,7 +199,7 @@ impl CharacterPreparation<'_> {
         let mut chars = Vec::new();
         let mut substituted = None;
         let mut fallback = FallbackBuilder::new(max_glyphs);
-        let mut resolver = FontResolver { doc, fonts, metrics, full_faces: HashMap::new(), programs: HashMap::new() };
+        let mut resolver = FontResolver { doc, fonts, metrics, full_faces: HashMap::new(), programs: HashMap::new(), substitutes: HashMap::new() };
         for (range, index) in spans {
             let source = lines.get(index).unwrap_or(first);
             let span = draft.get(range.clone()).unwrap_or_default();
@@ -272,18 +300,26 @@ impl CharacterPreparation<'_> {
                     name.clone()
                 } else if let Some(name) = resolver.encodable_font(source, &text, requested)? {
                     name
-                } else if needs_type3(&text) {
-                    fallback.prepare(source, ch, &text, chars.len())?
-                } else {
-                    let name = resolver.substitute_font(source);
+                } else if !needs_type3(&text)
+                    && let Some(name) = resolver.substitute_for(source, &text)
+                {
                     substituted = Some(source_family(&source.base_font).base_font(source.bold, source.italic).to_owned());
                     name
+                } else {
+                    match fallback.prepare(source, ch, &text, chars.len()) {
+                        Ok(name) => name,
+                        Err(refusal) => match resolver.any_page_font(&text) {
+                            Some(name) => name,
+                            None => fallback.prepare_undrawable(source, ch, chars.len(), refusal)?,
+                        },
+                    }
                 };
                 chars.push((ch, index, name));
             }
         }
         drop(resolver);
-        for group in fallback.groups {
+        // A face asked only for characters it lacks drew nothing: it writes no font.
+        for group in fallback.groups.into_iter().filter(|group| !group.glyphs.is_empty()) {
             let written = write_type3_glyphs(doc, fonts, group.face, false, group.glyphs, fallback.per_font);
             for name in &written.names {
                 let font = fonts
@@ -322,28 +358,82 @@ impl FallbackBuilder {
         } else {
             let (faces, _) = type3_faces(text, source_family(&source.base_font), source.bold)?;
             let face = fallback_face(&faces, &[ch], |face, ch| japanese_glyph_from(face, ch).is_ok()).ok_or_else(|| no_fallback_font(text))?;
-            let index = self.groups.iter().position(|group| std::ptr::eq(group.face, face)).unwrap_or_else(|| {
-                let index = self.groups.len();
-                self.groups.push(FallbackGroup { face, seen: Default::default(), glyphs: Vec::new(), positions: Vec::new() });
-                index
-            });
+            let index = self.group_of(face);
             self.names.insert(key, index);
             index
         };
-        let group = self.groups.get_mut(group_index).ok_or_else(|| EditError::Invalid("the fallback face is missing".into()))?;
-        if group.seen.insert(ch) {
+        let group = self.groups.get(group_index).ok_or_else(|| EditError::Invalid("the fallback face is missing".into()))?;
+        let (face, already_drawn) = (group.face, group.seen.contains(&ch));
+        if !already_drawn {
             if self.glyphs >= self.budget {
                 return Err(EditError::Invalid(format!(
                     "the replacement needs more than {} fallback glyphs; edit a smaller paragraph or load a complete font",
                     self.budget
                 )));
             }
-            let (path, width) = type3_glyph(group.face, ch)?.ok_or_else(|| no_glyph_for(group.face, ch))?;
-            let code = u8::try_from((group.glyphs.len() % self.per_font).saturating_add(1))
-                .map_err(|_| EditError::Invalid("replacement text has too many unique characters".into()))?;
-            group.glyphs.push(Type3Glyph { code, ch, path, width });
-            self.glyphs = self.glyphs.saturating_add(1);
+            let (path, width) = type3_glyph(face, ch)?.ok_or_else(|| no_glyph_for(face, ch))?;
+            self.add_glyph(group_index, ch, path, width)?;
         }
+        self.show_at(group_index, position)
+    }
+
+    /// Draws `ch` although no fallback face and no font of the page has it, where the build does
+    /// that ([`draws_undrawable_characters`]): with the outline of an installed face, else as a
+    /// placeholder in a fallback font the edit writes anyway. Otherwise `refusal` stands.
+    fn prepare_undrawable(&mut self, source: &TextLine, ch: char, position: usize, refusal: EditError) -> Result<String, EditError> {
+        if !draws_undrawable_characters() || self.glyphs >= self.budget {
+            return Err(refusal);
+        }
+        let (face, path, width) = match installed_glyph(ch) {
+            Some(drawn) => drawn,
+            None => {
+                let Some(face) = self.placeholder_face(source) else { return Err(refusal) };
+                let (path, width) = placeholder_glyph(ch);
+                (face, path, width)
+            }
+        };
+        let group_index = self.group_of(face);
+        // The face first asked for the character did not have it: later ones go straight here.
+        self.names.insert((source.base_font.clone(), source.bold, ch), group_index);
+        if !self.groups.get(group_index).is_some_and(|group| group.seen.contains(&ch)) {
+            self.add_glyph(group_index, ch, path, width)?;
+        }
+        self.show_at(group_index, position)
+    }
+
+    /// The face whose generated font holds a placeholder: one the edit already draws with, else
+    /// the first fallback face for `source` (the bundled Latin face is always among them).
+    fn placeholder_face(&self, source: &TextLine) -> Option<&'static CraftFont> {
+        if let Some(group) = self.groups.first() {
+            return Some(group.face);
+        }
+        let (faces, _) = type3_faces("", source_family(&source.base_font), source.bold).ok()?;
+        faces.first().copied()
+    }
+
+    /// The group that draws with `face`, added when this is its first character.
+    fn group_of(&mut self, face: &'static CraftFont) -> usize {
+        self.groups.iter().position(|group| std::ptr::eq(group.face, face)).unwrap_or_else(|| {
+            let index = self.groups.len();
+            self.groups.push(FallbackGroup { face, seen: Default::default(), glyphs: Vec::new(), positions: Vec::new() });
+            index
+        })
+    }
+
+    fn add_glyph(&mut self, group_index: usize, ch: char, path: Vec<u8>, width: f64) -> Result<(), EditError> {
+        let group = self.groups.get_mut(group_index).ok_or_else(|| EditError::Invalid("the fallback face is missing".into()))?;
+        let code = u8::try_from((group.glyphs.len() % self.per_font).saturating_add(1))
+            .map_err(|_| EditError::Invalid("replacement text has too many unique characters".into()))?;
+        group.glyphs.push(Type3Glyph { code, ch, path, width });
+        // Only now: a character the face could not draw is not remembered as drawn.
+        group.seen.insert(ch);
+        self.glyphs = self.glyphs.saturating_add(1);
+        Ok(())
+    }
+
+    /// Records that the character at `position` of the draft is shown by this group's font.
+    fn show_at(&mut self, group_index: usize, position: usize) -> Result<String, EditError> {
+        let group = self.groups.get_mut(group_index).ok_or_else(|| EditError::Invalid("the fallback face is missing".into()))?;
         group.positions.push(position);
         Ok(String::new())
     }
@@ -550,10 +640,44 @@ impl ShapedRunDrawing<'_> {
     }
 }
 
+/// Whether the edit's rows are put in drawing order and drawn character by character, rather
+/// than each run shaped where it stands: for Hebrew, whose letters don't join (the single-style
+/// path writes it the same way), and, where the build draws what it can't shape, for other
+/// right-to-left text that no font program here shapes. Drawn in typing order, such a run would
+/// read backwards.
+fn rows_in_drawing_order(doc: &Document, fonts: &Dict, thai: &ThaiShaping, chars: &[StyledChar]) -> Result<bool, EditError> {
+    if chars.iter().any(|c| crate::bidi::is_hebrew(c.0)) {
+        return Ok(true);
+    }
+    if !draws_undrawable_characters() || !chars.iter().any(|c| crate::bidi::is_rtl(c.0)) {
+        return Ok(false);
+    }
+    let mut at = 0;
+    while let Some(item) = chars.get(at) {
+        let end = styled_run_end(chars, at);
+        let text: String = chars.get(at..end).unwrap_or_default().iter().map(|c| c.0).filter(|c| !matches!(c, '\n' | '\r')).collect();
+        if text.chars().any(crate::bidi::is_rtl) && shape_source(doc, fonts, thai, &item.2, &text)?.is_none() {
+            return Ok(true);
+        }
+        at = end;
+    }
+    Ok(false)
+}
+
+/// `row` in the order it is drawn, left to right ([`crate::bidi::visual_order`]), each character
+/// keeping its style and font.
+fn in_drawing_order(row: &[StyledChar]) -> Vec<StyledChar> {
+    let text: String = row.iter().map(|c| c.0).collect();
+    crate::bidi::visual_order(&text).into_iter().filter_map(|(index, drawn)| row.get(index).map(|c| (drawn, c.1, c.2.clone()))).collect()
+}
+
 fn validate_contextual_rows(rows: &[Vec<StyledChar>], kept: &[bool]) -> Result<(), EditError> {
     for (row, _) in rows.iter().zip(kept).filter(|(_, retained)| !**retained) {
         let text: String = row.iter().map(|character| character.0).collect();
+        // A build that draws what it has no glyph for writes such a row character by character,
+        // unshaped, rather than refusing it ([`shape_source`] does the same for one run).
         if pdfcraft_fonts::source_shaping::required(&text)
+            && !draws_undrawable_characters()
             && row.first().is_some_and(|first| row.iter().any(|character| character.1 != first.1 || character.2 != first.2))
         {
             return Err(EditError::Invalid(
@@ -1257,7 +1381,7 @@ fn shape_source(doc: &Document, fonts: &Dict, thai: &ThaiShaping, name: &str, te
             .ok_or_else(|| EditError::Invalid(format!("{family} cannot shape this text with its own layout; choose a font that covers it")))?;
         return Ok(Some(ShapedText { run: shaped, font: ShapedFont::Program { bytes, family } }));
     }
-    if !pdfcraft_fonts::source_shaping::required(text) {
+    if !pdfcraft_fonts::source_shaping::required(text) || (thai.rows_in_drawing_order && text.chars().any(crate::bidi::is_rtl)) {
         return Ok(None);
     }
     let source =
@@ -1278,6 +1402,12 @@ fn shape_source(doc: &Document, fonts: &Dict, thai: &ThaiShaping, name: &str, te
         if let Some((bytes, shaped)) = shape_with_program(doc, &font, text) {
             return Ok(Some(ShapedText { run: shaped, font: ShapedFont::Program { bytes, family } }));
         }
+    }
+    // No program shapes the run. Its font holds every character of it (that is how they came to
+    // be in this font), so a build that draws what it cannot shape shows them one by one: marks
+    // sit where their own glyphs put them and letters keep their isolated forms.
+    if draws_undrawable_characters() {
+        return Ok(None);
     }
     if let Some(error) = in_place {
         return Err(error);
@@ -1411,6 +1541,75 @@ fn untouched_rows(block: &TextBlock, draft: &str, rows: &[std::ops::Range<usize>
             })
         })
         .collect()
+}
+
+/// How a justified row is stretched to the paragraph's width: the room added after each space
+/// that can take it. Word spacing (`Tw`) reaches only single-byte code 32, which a composite or
+/// generated font doesn't use, so the room is given by where the next word is placed instead.
+struct RowStretch {
+    /// The room after one such space, in user space.
+    gap: f64,
+    /// For each character of the row, whether it is a space that takes the room.
+    stretched: Vec<bool>,
+}
+
+impl RowStretch {
+    fn none() -> Self {
+        Self { gap: 0.0, stretched: Vec::new() }
+    }
+
+    /// The spaces between the row's first and last word take the room. Those before its first
+    /// word and after its last stay as they are, and so do those inside a run shaped as one piece.
+    fn of(
+        row: &[StyledChar],
+        row_index: usize,
+        shaped_runs: &ShapedRunCache,
+        char_advances: &HashMap<(usize, usize), Vec<f64>>,
+        row_width: f64,
+        available: f64,
+    ) -> Self {
+        let body_start = row.iter().position(|c| c.0 != ' ').unwrap_or(row.len());
+        let body_end = row.iter().rposition(|c| c.0 != ' ').map_or(0, |last| last.saturating_add(1));
+        let mut stretched = vec![false; row.len()];
+        let mut trailing_width = 0.0;
+        let mut pos = 0;
+        while pos < row.len() {
+            let end = styled_run_end(row, pos);
+            let widths = char_advances.get(&(row_index, pos)).map(Vec::as_slice).unwrap_or(&[]);
+            let takes_room = !shaped_runs.contains_key(&(row_index, pos));
+            for index in pos..end {
+                if index >= body_end {
+                    trailing_width += widths.get(index.saturating_sub(pos)).copied().unwrap_or(0.0);
+                } else if let Some(slot) = stretched.get_mut(index) {
+                    *slot = takes_room && index >= body_start && row.get(index).is_some_and(|c| c.0 == ' ');
+                }
+            }
+            pos = end;
+        }
+        let spaces = stretched.iter().filter(|space| **space).count();
+        let room = available - (row_width - trailing_width);
+        if spaces == 0 || !room.is_finite() || room <= 0.0 {
+            return Self::none();
+        }
+        Self { gap: room / spaces as f64, stretched }
+    }
+
+    /// Where the piece that starts at `pos` ends: with its run, or on a stretched row after the
+    /// spaces that follow its first word. A run shaped as one piece (`whole`) is never cut.
+    fn piece_end(&self, pos: usize, run_end: usize, whole: bool) -> usize {
+        if whole || self.gap <= 0.0 {
+            return run_end;
+        }
+        let is_stretched = |index: usize| self.stretched.get(index).copied().unwrap_or(false);
+        let last_space = (pos..run_end).find(|index| is_stretched(*index) && !is_stretched(index.saturating_add(1)));
+        last_space.map_or(run_end, |last| last.saturating_add(1).min(run_end))
+    }
+
+    /// The room that follows the characters `from..to`: one gap for each stretched space among them.
+    fn room(&self, from: usize, to: usize) -> f64 {
+        let spaces = self.stretched.get(from..to).unwrap_or_default().iter().filter(|space| **space).count();
+        self.gap * spaces as f64
+    }
 }
 
 fn segment_underline_runs(
@@ -1894,8 +2093,9 @@ pub(crate) fn rewrite_styled_block(
         max_glyphs,
     }
     .prepare()?;
-    let thai = prepared.thai;
+    let mut thai = prepared.thai;
     let chars = prepared.values;
+    thai.rows_in_drawing_order = rows_in_drawing_order(doc, &fonts, &thai, &chars)?;
     let substituted = prepared.substituted;
     let phrase_size = block.phrase_size();
     let size_of = |source: &TextLine, index: usize| {
@@ -1967,6 +2167,11 @@ pub(crate) fn rewrite_styled_block(
         Ok(width)
     };
     let (mut rows, row_ranges, row_lines, row_soft, row_gap, explicit) = wrap_styled_rows(&chars, width, measure)?;
+    if thai.rows_in_drawing_order {
+        for row in &mut rows {
+            *row = in_drawing_order(row);
+        }
+    }
     let space_styles: Vec<_> = rows.iter_mut().map(|row| assign_subset_space_fonts(row, &metrics)).collect();
     let streams = content_streams(doc, &p.dict)?;
     let pieces = crate::text::joined(&streams);
@@ -1995,7 +2200,10 @@ pub(crate) fn rewrite_styled_block(
     // What is in force where the rewrite is drawn, and what the text after it expects.
     let after = if split { &o.state } else { &o.bt_state };
     let at = if split { start } else { o.bt_op };
-    validate_contextual_rows(&rows, &kept)?;
+    // Rows in drawing order are drawn character by character: a row may mix fonts and styles.
+    if !thai.rows_in_drawing_order {
+        validate_contextual_rows(&rows, &kept)?;
+    }
     let measured: Vec<_> = rows.iter().map(|row| measure(row)).collect::<Result<_, _>>()?;
     let shaped = prepare_shaped_rows(doc, &fonts, &thai, &rows, &kept, advance)?;
     let ShapedRows { runs: shaped_runs, advances: segment_advances, char_advances } = shaped;
@@ -2066,11 +2274,22 @@ pub(crate) fn rewrite_styled_block(
                 crate::added::Align::Right => available - w,
                 _ => 0.0,
             };
+        // Justified: every row but the last fills the width, with the room left over after its spaces.
+        let justified = align == crate::added::Align::Justify && row_index.saturating_add(1) < rows.len();
+        let stretch = if justified { RowStretch::of(row, row_index, &shaped_runs, &char_advances, w, available) } else { RowStretch::none() };
         let mut pos = 0;
+        // The run of one style and font the next piece belongs to: shaping and measured widths
+        // are kept by where a run starts.
+        let (mut run_start, mut run_end) = (0, 0);
         while pos < row.len() {
             let Some(item) = row.get(pos) else { break };
             let source = lines.get(item.1).unwrap_or(first);
-            let end = styled_run_end(row, pos);
+            if pos >= run_end {
+                run_start = pos;
+                run_end = styled_run_end(row, pos);
+            }
+            // A whole run, or on a stretched row a word with the spaces after it.
+            let end = stretch.piece_end(pos, run_end, shaped_runs.contains_key(&(row_index, run_start)));
             let segment = row.get(pos..end).unwrap_or_default();
             let string: String = segment.iter().map(|c| c.0).collect();
             let m = metrics.get(&item.2).ok_or_else(|| EditError::Invalid("the paragraph font is missing".into()))?;
@@ -2082,7 +2301,7 @@ pub(crate) fn rewrite_styled_block(
             if let Some(s) = overrides.get(&item.1).and_then(|r| r.scale).or(style.scale) {
                 state.scale = (s / 100.0).clamp(0.1, 10.0);
             }
-            if !shaped_runs.contains_key(&(row_index, pos)) {
+            if !shaped_runs.contains_key(&(row_index, run_start)) {
                 state.scale *= calibration.get(&item.1).copied().unwrap_or(1.0);
             }
             if let Some([r, g, b]) = overrides.get(&item.1).and_then(|r| r.color).or(style.color) {
@@ -2093,14 +2312,18 @@ pub(crate) fn rewrite_styled_block(
             let (ax, ay) = back.apply(x - source.origin.x, baseline - source.origin.baseline);
             tm[4] += ax;
             tm[5] += ay;
-            let mut segment_width = segment_advances.get(&(row_index, pos)).copied().unwrap_or(0.0);
+            let run_widths = char_advances.get(&(row_index, run_start)).map(Vec::as_slice).unwrap_or(&[]);
+            let widths = run_widths.get(pos.saturating_sub(run_start)..end.saturating_sub(run_start)).unwrap_or(&[]);
+            let whole_run = pos == run_start && end == run_end;
+            let mut segment_width =
+                if whole_run { segment_advances.get(&(row_index, run_start)).copied().unwrap_or(0.0) } else { widths.iter().sum() };
             // Each run in its own graphics state, restating what its source set inside its text
             // object (`gs`, stroke, line width, `Tr`; #3508/#3509) from the state the rewrite is
             // drawn in: a `gs` has no inverse, so one run's ExtGState would stay for the next.
             block_ops.push(Op::new("q", vec![]));
             block_ops.extend(state.paint_ops(drawn_from, run_ctm));
-            if let Some(shaped) = shaped_runs.get(&(row_index, pos)) {
-                let resources = glyph_resources.get(&(row_index, pos)).ok_or_else(|| EditError::Invalid("shaped font is missing".into()))?;
+            if let Some(shaped) = shaped_runs.get(&(row_index, run_start)) {
+                let resources = glyph_resources.get(&(row_index, run_start)).ok_or_else(|| EditError::Invalid("shaped font is missing".into()))?;
                 let drawing = ShapedRunDrawing {
                     doc,
                     fonts: &fonts,
@@ -2128,9 +2351,10 @@ pub(crate) fn rewrite_styled_block(
             }
             // A space reassigned onto a neighbour keeps that neighbour's grouping key, and its
             // own style for the underline. Stroke each run of one underline style separately.
-            let widths = char_advances.get(&(row_index, pos)).map(Vec::as_slice).unwrap_or(&[]);
+            // The room after the piece's spaces is underlined with it, so the line has no breaks.
+            let room = stretch.room(pos, end);
             for (style_index, from, to) in
-                segment_underline_runs(widths, segment_width, x, item.1, space_styles.get(row_index).map(Vec::as_slice), pos)
+                segment_underline_runs(widths, segment_width + room, x, item.1, space_styles.get(row_index).map(Vec::as_slice), pos)
             {
                 let source = lines.get(style_index).unwrap_or(first);
                 if underlines.get(&style_index).copied().or(style.underline) != Some(true) || to <= from {
@@ -2147,7 +2371,7 @@ pub(crate) fn rewrite_styled_block(
                 block_ops.push(Op::new("S", vec![]));
             }
             block_ops.push(Op::new("Q", vec![]));
-            x += segment_width;
+            x += segment_width + room;
             pos = end;
         }
         baseline -= row_step(style, anchor.size, source_leading);

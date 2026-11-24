@@ -15,6 +15,8 @@ use crate::PdfCraftApp;
 pub enum FilePurpose {
     TextFont {
         page: usize,
+        /// Which face of a collection file to load (0 for a standalone font).
+        face_index: u32,
     },
     Combine,
     InsertPages,
@@ -94,7 +96,7 @@ pub(crate) fn installed_font_files(ctx: &egui::Context, reload: bool) -> Option<
 fn files_picker(purpose: FilePurpose) -> rfd::AsyncFileDialog {
     let dialog = rfd::AsyncFileDialog::new();
     if matches!(purpose, FilePurpose::TextFont { .. }) {
-        return dialog.add_filter_any_case("TrueType / OpenType font", &["ttf", "otf"]);
+        return dialog.add_filter_any_case("TrueType / OpenType font", &["ttf", "otf", "ttc", "otc"]);
     }
     if purpose == FilePurpose::RedactWords {
         return dialog.add_filter_any_case(tl!("Text"), &["txt"]);
@@ -427,7 +429,7 @@ impl PdfCraftApp {
                 use std::io::Read;
                 std::fs::File::open(p).and_then(|f| {
                     let mut bytes = Vec::new();
-                    f.take((16 << 20) + 1).read_to_end(&mut bytes)?;
+                    f.take(pdfcraft_fonts::embedding::MAX_FONT_FILE_BYTES as u64 + 1).read_to_end(&mut bytes)?;
                     Ok(bytes)
                 })
             } else {
@@ -560,9 +562,12 @@ impl PdfCraftApp {
     /// Use picked files (also the entry point for tests and automation).
     pub fn use_files(&mut self, purpose: FilePurpose, files: Vec<(String, Vec<u8>)>) {
         match purpose {
-            FilePurpose::TextFont { page } => {
+            FilePurpose::TextFont { page, face_index } => {
                 let Some((_, bytes)) = files.into_iter().next() else { return };
-                let bytes = Arc::new(bytes);
+                // The face as the page will hold it: a file that can't give one goes on as it is,
+                // and registering it reports why.
+                let face = pdfcraft_fonts::embedding::standalone_face(&bytes, face_index).map(std::borrow::Cow::into_owned);
+                let bytes = Arc::new(face.unwrap_or(bytes));
                 if !self.apply_edit(Edit::RegisterTextFont { page, bytes: bytes.clone() }) {
                     return;
                 }
@@ -1253,6 +1258,7 @@ mod font_scan_tests {
             path: "installed.ttf".into(),
             family: "Installed".into(),
             face: "Installed".into(),
+            face_index: 0,
         }]);
         assert!(cache.begin(true), "a populated scan can discover newly installed fonts");
         assert!(cache.files.is_none());

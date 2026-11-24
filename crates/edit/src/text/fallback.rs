@@ -1,6 +1,7 @@
 use super::HashSet;
 use super::interp::{Shown, Ts};
 use super::lines::page_dict;
+use super::undrawable::{draws_undrawable_characters, installed_glyph, placeholder_glyph};
 use super::{
     CraftFont, Dict, Document, EditError, GlyphError, HashMap, Metrics, Object, Op, PdfString, Stream, TextLine, japanese_glyph_from, parse,
 };
@@ -39,28 +40,37 @@ pub(crate) fn needs_type3(text: &str) -> bool {
 /// The `/Name` of the Type 3 fonts generated for Japanese text.
 const JAPANESE_FONT_NAME: &str = "PCJapanese";
 
+/// The `/Name` of the Type 3 fonts generated from a Korean face.
+const KOREAN_FONT_NAME: &str = "PCKorean";
+
 /// The `/Name` of the Type 3 fonts generated for Hebrew text.
 const HEBREW_FONT_NAME: &str = "PCHebrew";
 
 /// The `/Name` of the Type 3 fonts generated from the bundled Latin (Inter) face.
 const LATIN_FONT_NAME: &str = "PCLatin";
 
-/// Whether `font` is one of those generated fonts (Latin, Japanese, Hebrew or Thai): a replacement longer
-/// than one of them is split across several, which read back as one line (see [`same_font`]).
+/// Whether `font` is one of those generated fonts (Latin, Japanese, Korean, Hebrew or Thai): a replacement
+/// longer than one of them is split across several, which read back as one line (see [`same_font`]).
 pub(super) fn is_type3_fallback(font: &Dict) -> bool {
     font.name(b"Subtype") == Some(b"Type3")
         && font.name(b"Name").is_some_and(|n| {
-            n == JAPANESE_FONT_NAME.as_bytes() || n == HEBREW_FONT_NAME.as_bytes() || n == LATIN_FONT_NAME.as_bytes() || n == b"PCThai"
+            n == JAPANESE_FONT_NAME.as_bytes()
+                || n == KOREAN_FONT_NAME.as_bytes()
+                || n == HEBREW_FONT_NAME.as_bytes()
+                || n == LATIN_FONT_NAME.as_bytes()
+                || n == b"PCThai"
         })
 }
 
-/// The generated font's `/Name` and its resource prefix: the bundled Latin face, Hebrew, or the
-/// Japanese ones.
+/// The generated font's `/Name` and its resource prefix: the bundled Latin face, Hebrew, Korean,
+/// or the Japanese ones.
 fn fallback_names(face: &CraftFont, hebrew: bool) -> (&'static str, &'static str) {
     if hebrew {
         (HEBREW_FONT_NAME, "PCHe")
     } else if face.family == "Inter" {
         (LATIN_FONT_NAME, "PCLat")
+    } else if is_korean_face(face) {
+        (KOREAN_FONT_NAME, "PCKo")
     } else {
         (JAPANESE_FONT_NAME, "PCJp")
     }
@@ -207,15 +217,17 @@ pub fn strip_subset_tag(name: &str) -> &str {
     if is_tag { name.get(7..).unwrap_or(name) } else { name }
 }
 
+/// Lower-case pieces of a font name that mark a serif face. The Korean ones (Batang, Myeongjo or
+/// Myungjo, Gungsuh) matter for Japanese: Hancom documents set brackets and spaces in Batang, and
+/// kana typed there would otherwise take a Gothic fallback inside a Mincho line.
+const SERIF_FAMILY_HINTS: [&str; 12] =
+    ["times", "serif", "roman", "mincho", "cambria", "georgia", "palatino", "garamond", "batang", "myeongjo", "myungjo", "gungsuh"];
+
 pub(crate) fn source_family(base_font: &str) -> crate::added::Family {
     let name = base_font.to_ascii_lowercase();
     if ["courier", "mono", "consolas", "menlo", "monaco", "lucida console"].iter().any(|s| name.contains(s)) {
         crate::added::Family::Courier
-    } else if !name.contains("sans")
-        && ["times", "serif", "roman", "mincho", "cambria", "georgia", "palatino", "garamond", "myeongjo", "batang", "gungsuh"]
-            .iter()
-            .any(|s| name.contains(s))
-    {
+    } else if !name.contains("sans") && SERIF_FAMILY_HINTS.iter().any(|s| name.contains(s)) {
         crate::added::Family::Times
     } else {
         crate::added::Family::Helvetica
@@ -320,6 +332,9 @@ pub(crate) fn no_fallback_font(text: &str) -> EditError {
     if text.chars().any(needs_japanese) {
         return no_japanese_font();
     }
+    if text.chars().any(needs_korean) {
+        return no_korean_font();
+    }
     let Some(ch) = text.chars().find(|c| !c.is_whitespace() && !is_win_ansi_char(*c)) else { return no_japanese_font() };
     EditError::Invalid(format!(
         "the paragraph's font has no glyph for {ch} (U+{:04X}) and this build has no fallback font for it; \
@@ -335,12 +350,27 @@ fn needs_japanese(ch: char) -> bool {
     matches!(u32::from(ch), 0x3000..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF)
 }
 
+/// The characters the craft-fonts Korean face is for: Hangul compatibility jamo (U+3130–U+318F)
+/// and Hangul syllables (U+AC00–U+D7A3). Conjoining jamo (U+1100…) are left out: they are composed
+/// by shaping, which a one-glyph-per-character Type 3 font can't do.
+fn needs_korean(ch: char) -> bool {
+    matches!(u32::from(ch), 0x3130..=0x318F | 0xAC00..=0xD7A3)
+}
+
+/// Whether `face` is a Korean craft-fonts face (NanumGothic is tagged `Hang` and `Kore`).
+fn is_korean_face(face: &CraftFont) -> bool {
+    face.covers("Kore") || face.covers("Hang")
+}
+
 /// The chosen face has no outline for `ch`, and neither has any other: say which character it is and
-/// what the writer can do about it. A CJK character without a Japanese face in the build is about
-/// that build input, which is the one answer that changes it.
+/// what the writer can do about it. A CJK character without a Japanese face in the build, or Hangul
+/// without a Korean one, is about that build input, which is the one answer that changes it.
 pub(crate) fn no_glyph_for(face: &CraftFont, ch: char) -> EditError {
     if needs_japanese(ch) && pdfcraft_fonts::document_japanese_font().is_none() {
         return no_japanese_font();
+    }
+    if needs_korean(ch) && pdfcraft_fonts::document_korean_font().is_none() {
+        return no_korean_font();
     }
     EditError::Invalid(format!(
         "the {} fallback font has no glyph for {ch} (U+{:04X}), and no fallback face covers the text; \
@@ -356,6 +386,15 @@ pub(super) fn no_japanese_font() -> EditError {
     EditError::Invalid(
         "this text needs PdfCraft's Japanese fallback font, which this build doesn't include \
          (official releases do; to build it in, set CRAFT_FONTS_DIR to a craft-fonts checkout)"
+            .into(),
+    )
+}
+
+/// This build has no Korean face to draw replacement text with.
+fn no_korean_font() -> EditError {
+    EditError::Invalid(
+        "this text needs PdfCraft's Korean fallback font (NanumGothic), which this build doesn't include \
+         (to build it in, set CRAFT_FONTS_DIR to a craft-fonts checkout that has it)"
             .into(),
     )
 }
@@ -396,17 +435,23 @@ pub(crate) fn type3_faces(text: &str, family: crate::added::Family, bold: bool) 
         return Ok((faces, false));
     }
     // Points are drawn on their letter with the font's positioning, which a one-glyph-per-
-    // character Type 3 font can't do; refuse rather than print them beside the letter.
-    if text.chars().any(crate::bidi::is_hebrew_mark) {
+    // character Type 3 font can't do; refuse rather than print them beside the letter. A build
+    // that draws what it has no glyph for keeps them in the text, placed as their face draws them.
+    if text.chars().any(crate::bidi::is_hebrew_mark) && !draws_undrawable_characters() {
         return Err(EditError::Invalid("Hebrew points (niqqud) can't be written into a PDF yet; type the text without them".into()));
     }
-    let hebrew = pdfcraft_fonts::document_hebrew_font(bold).ok_or_else(no_hebrew_font)?;
-    Ok((std::iter::once(hebrew).chain(japanese).chain(latin).chain(korean).chain(rest).collect(), true))
+    // Without a Hebrew face the other faces stand first, and each letter comes from the last
+    // resort of a build that draws what it has no glyph for; every other build refuses here.
+    let hebrew = pdfcraft_fonts::document_hebrew_font(bold);
+    if hebrew.is_none() && !draws_undrawable_characters() {
+        return Err(no_hebrew_font());
+    }
+    Ok((hebrew.into_iter().chain(japanese).chain(latin).chain(korean).chain(rest).collect(), true))
 }
 
 /// Hangul: the jamo, compatibility jamo, extended jamo and the precomposed syllables.
 pub(crate) fn is_hangul(ch: char) -> bool {
-    matches!(u32::from(ch), 0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xAC00..=0xD7AF | 0xD7B0..=0xD7FF)
+    pdfcraft_fonts::is_hangul(ch)
 }
 
 pub(super) fn type3_font(
@@ -462,12 +507,22 @@ pub(super) fn type3_font(
             }
             drawn
         };
-        let Some((path, width)) = drawn else { return Err(no_glyph_for(face, ch)) };
+        let Some((path, width)) = drawn.or_else(|| last_resort_glyph(ch)) else { return Err(no_glyph_for(face, ch)) };
         let code = u8::try_from((i % per_font).saturating_add(1))
             .map_err(|_| EditError::Invalid("replacement text has too many unique characters".into()))?;
         glyphs.push(Type3Glyph { code, ch, path, width });
     }
     Ok(write_type3_glyphs(doc, fonts_res, face, hebrew, glyphs, per_font))
+}
+
+/// What draws `ch` when no fallback face has it, in a build that draws such a character
+/// ([`draws_undrawable_characters`]): an installed face's outline, else a placeholder. The
+/// generated font is a set of glyph procedures, so one from another face sits in it like the rest.
+fn last_resort_glyph(ch: char) -> Option<(Vec<u8>, f64)> {
+    if !draws_undrawable_characters() {
+        return None;
+    }
+    Some(installed_glyph(ch).map_or_else(|| placeholder_glyph(ch), |(_, path, width)| (path, width)))
 }
 
 /// Write already validated outlines; callers can prepare every face before adding any objects.

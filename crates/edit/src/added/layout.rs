@@ -1,4 +1,4 @@
-use super::types::{AddedImage, AddedText};
+use super::types::{AddedImage, AddedText, Family};
 use super::{
     Content, Document, EditError, GlyphError, Level, ObjRef, Object, ParagraphBidiInfo, ShapedScript, shape_arabic, shape_hebrew, shape_thai,
 };
@@ -46,13 +46,20 @@ pub(super) fn wrapped(t: &AddedText) -> Vec<(String, bool, usize)> {
             out.extend(lines.into_iter().map(|line| (line, false, index)));
             continue;
         }
+        // Korean or Japanese: a row may end between any two of their characters.
+        let cjk = para.chars().any(|c| cjk_face(t, c).is_some());
+        if cjk
+            && !rtl_script
+            && let Ok(lines) = cjk_lines(t, para, width)
+        {
+            out.extend(lines.into_iter().map(|line| (line, false, index)));
+            continue;
+        }
         let rtl = rtl_script && unicode_bidi::get_base_direction(para) == unicode_bidi::Direction::Rtl;
         // Arabic words are shaped one by one (joining stops at spaces), so a line's width is the
         // sum of its words' and shaping stays linear in the paragraph's length. The space is the
         // paragraph's; a space between Latin words is drawn in the item's font, a few hundredths
         // of an em apart.
-        // Korean and Japanese are measured as their faces draw them, too.
-        let cjk = para.chars().any(|c| pdfcraft_fonts::cjk_fallback(c).is_some());
         let measure = |s: &str| if rtl_script || thai || cjk { shaped_width(t, s, rtl) } else { latin_width(t, s) };
         let space = measure(" ");
         let (mut line, mut line_w) = (String::new(), 0.0);
@@ -98,6 +105,87 @@ fn thai_lines(t: &AddedText, para: &str, width: f64) -> Result<Vec<String>, Edit
         }
     }
     Ok(wrap_words(thai_words(atoms), width))
+}
+
+/// Korean and Japanese wrapping. Those scripts put no spaces between words, so a row may end
+/// between any two of their characters as well as at a space; Latin words in the paragraph stay
+/// whole. Closing punctuation stays on the row of the character before it, and an opening bracket
+/// on the row of the character after it.
+fn cjk_lines(t: &AddedText, para: &str, width: f64) -> Result<Vec<String>, EditError> {
+    let (pieces, _) = shaped_layout(t, para, false)?;
+    let mut atoms = Vec::new();
+    for piece in pieces {
+        match piece {
+            Piece::Shaped(clusters) => atoms.extend(clusters.into_iter().map(|c| (c.text, c.advance * t.size + t.char_spacing))),
+            Piece::Latin(s) => atoms.extend(s.chars().map(|c| {
+                let text = c.to_string();
+                let w = latin_width(t, &text);
+                (text, w)
+            })),
+        }
+    }
+    Ok(wrap_words(cjk_words(t, atoms), width))
+}
+
+/// Closing punctuation a row must not begin with.
+const CJK_CLOSING_PUNCTUATION: &str = "、。，．・：；！？）」』】〕〉》ー";
+/// Opening brackets a row must not end with.
+const CJK_OPENING_BRACKETS: &str = "（「『【〔〈《";
+
+/// What an atom is to the Korean and Japanese wrapper.
+#[derive(Clone, Copy, PartialEq)]
+enum CjkAtom {
+    Space,
+    /// A character of the Korean or Japanese faces: a row may end before or after it.
+    Wide,
+    /// Closing punctuation: joins the word before it.
+    Closing,
+    /// An opening bracket: the atom after it joins its word.
+    Opening,
+    /// Latin text, digits and anything else: breaks only at spaces.
+    Other,
+}
+
+fn cjk_atom(t: &AddedText, text: &str) -> CjkAtom {
+    let Some(first) = text.chars().next() else { return CjkAtom::Other };
+    if text.chars().all(char::is_whitespace) {
+        CjkAtom::Space
+    } else if CJK_CLOSING_PUNCTUATION.contains(first) {
+        CjkAtom::Closing
+    } else if CJK_OPENING_BRACKETS.contains(first) {
+        CjkAtom::Opening
+    } else if cjk_face(t, first).is_some() {
+        CjkAtom::Wide
+    } else {
+        CjkAtom::Other
+    }
+}
+
+/// `atoms` (text and advance) grouped into the words [`wrap_words`] keeps whole: each Korean or
+/// Japanese character is a word of its own, with the punctuation and spaces that must stay on its
+/// row, and a run of other characters is a word up to its next space.
+fn cjk_words(t: &AddedText, atoms: Vec<(String, f64)>) -> Vec<Vec<(String, f64)>> {
+    let mut words: Vec<Vec<(String, f64)>> = Vec::new();
+    let mut previous: Option<CjkAtom> = None;
+    for atom in atoms {
+        let kind = cjk_atom(t, &atom.0);
+        let starts_word = match (previous, kind) {
+            (None, _) => true,
+            // Spaces and closing punctuation hang on the word before them.
+            (_, CjkAtom::Space | CjkAtom::Closing) => false,
+            (Some(CjkAtom::Opening), _) => false,
+            (Some(CjkAtom::Space), _) => true,
+            (_, CjkAtom::Wide | CjkAtom::Opening) => true,
+            (Some(CjkAtom::Wide | CjkAtom::Closing), CjkAtom::Other) => true,
+            (Some(CjkAtom::Other), CjkAtom::Other) => false,
+        };
+        match words.last_mut() {
+            Some(word) if !starts_word => word.push(atom),
+            _ => words.push(vec![atom]),
+        }
+        previous = Some(kind);
+    }
+    words
 }
 
 /// `words` (each a list of text and advance, with the spaces that follow it) laid into rows no
@@ -196,6 +284,10 @@ pub(super) fn is_hebrew(c: char) -> bool {
 /// draw (or that has no face to draw it). Page-content tools refuse such text; the Add-text editor
 /// keeps it open.
 pub fn first_undrawable(t: &AddedText) -> Option<char> {
+    // Where the build has the last resort, it draws what no face has or can shape: nothing is `?`.
+    if crate::text::draws_undrawable_characters() {
+        return None;
+    }
     if t.text.chars().any(is_thai) {
         if let Some(c) = t.text.chars().find(|c| is_thai(*c) && !pdfcraft_fonts::thai_has(*c)) {
             return Some(c);
@@ -230,6 +322,7 @@ fn shaped_by_a_face(t: &AddedText) -> bool {
     t.text.chars().any(|c| pdfcraft_fonts::cjk_fallback(c).is_some())
         || (pdfcraft_fonts::document_arabic_font().is_some() && t.text.chars().any(is_arabic))
         || (pdfcraft_fonts::document_hebrew_font(false).is_some() && t.text.chars().any(is_hebrew))
+        || has_cjk(t)
 }
 
 /// An Arabic character the face shapes and draws (U+061C, a direction mark, is dropped).
@@ -289,7 +382,7 @@ pub(super) fn shaped_layout(t: &AddedText, line: &str, rtl: bool) -> Result<(Vec
             } else if is_arabic(c) || (run_rtl && !c.is_alphanumeric() && pdfcraft_fonts::arabic_has(c)) {
                 Some(ShapedScript::Arabic)
             } else {
-                None
+                cjk_face(t, c)
             };
             match segments.last_mut() {
                 Some((kind, s)) if *kind == script => s.push(c),
@@ -302,21 +395,24 @@ pub(super) fn shaped_layout(t: &AddedText, line: &str, rtl: bool) -> Result<(Vec
         for (script, s) in segments {
             pieces.push(if let Some(script) = script {
                 let shaped = match script {
-                    ShapedScript::Arabic => shape_arabic(&s, run_rtl).map_err(|e| arabic_error(e, &s))?,
-                    ShapedScript::Hebrew => shape_hebrew(&s, run_rtl).map_err(|e| hebrew_error(e, &s))?,
-                    ShapedScript::Thai => shape_thai(&s).map_err(|e| thai_error(e, &s))?,
-                    ShapedScript::Korean => {
-                        pdfcraft_fonts::shape_korean(&s).map_err(|e| EditError::Invalid(pdfcraft_fonts::shaped_text::shaped_message(e, &s)))?
-                    }
-                    ShapedScript::Japanese => {
-                        pdfcraft_fonts::shape_japanese(&s).map_err(|e| EditError::Invalid(pdfcraft_fonts::shaped_text::shaped_message(e, &s)))?
+                    ShapedScript::Arabic => shape_arabic(&s, run_rtl).map_err(|e| arabic_error(e, &s)),
+                    ShapedScript::Hebrew => shape_hebrew(&s, run_rtl).map_err(|e| hebrew_error(e, &s)),
+                    ShapedScript::Thai => shape_thai(&s).map_err(|e| thai_error(e, &s)),
+                    ShapedScript::Korean { .. } | ShapedScript::Japanese { .. } => {
+                        pdfcraft_fonts::shape_cjk(&s, script).map_err(|e| cjk_error(e, &s))
                     }
                     // Not a script this layout splits out; shaped as such all the same.
                     ShapedScript::Latin => {
-                        pdfcraft_fonts::shape_latin(&s).map_err(|e| EditError::Invalid(pdfcraft_fonts::shaped_text::latin_message(e, &s)))?
+                        pdfcraft_fonts::shape_latin(&s).map_err(|e| EditError::Invalid(pdfcraft_fonts::shaped_text::latin_message(e, &s)))
                     }
+                    ShapedScript::LastResort => Ok(pdfcraft_fonts::last_resort::shape(&s, run_rtl)),
                 };
-                Piece::Shaped(shaped)
+                // A run its face can't shape (the build has no such face, or it lacks a
+                // character) is drawn character by character where the build has the last resort.
+                Piece::Shaped(match shaped {
+                    Err(_) if crate::text::draws_undrawable_characters() => pdfcraft_fonts::last_resort::shape(&s, run_rtl),
+                    shaped => shaped?,
+                })
             } else if run_rtl {
                 Piece::Latin(s.chars().rev().map(mirrored).collect())
             } else {
@@ -356,6 +452,33 @@ pub(super) fn hebrew_error(e: GlyphError, text: &str) -> EditError {
 
 pub(super) fn thai_error(e: GlyphError, text: &str) -> EditError {
     EditError::Invalid(pdfcraft_fonts::shaped_text::thai_message(e, text))
+}
+
+pub(super) fn cjk_error(e: GlyphError, text: &str) -> EditError {
+    EditError::Invalid(match e {
+        GlyphError::NoFont => "Korean and Japanese text needs PdfCraft's Korean and Japanese fonts, which this build doesn't include \
+                               (to build them in, set CRAFT_FONTS_DIR to a craft-fonts checkout)"
+            .into(),
+        GlyphError::Missing => format!("the Korean and Japanese fonts can't show \"{text}\"; try other characters or shorter text"),
+        GlyphError::TooComplex => format!("the Korean or Japanese font's glyphs for \"{text}\" are too complex; try other characters"),
+    })
+}
+
+/// The Korean or Japanese face that draws `c` in the item, in its Myeongjo or Mincho kind when the
+/// item is set in Times. `None` for other characters and when the build has no face with it.
+///
+/// Where the build has the last resort, a character the item's standard font has no code for and
+/// no such face has is given to it ([`ShapedScript::LastResort`]): it is laid out, wrapped and
+/// drawn like those faces' characters, one glyph each.
+pub(super) fn cjk_face(t: &AddedText, c: char) -> Option<ShapedScript> {
+    let last_resort = || (crate::text::draws_undrawable_characters() && pdfcraft_fonts::last_resort::takes(c)).then_some(ShapedScript::LastResort);
+    pdfcraft_fonts::cjk_script(c, t.family == Family::Times).or_else(last_resort)
+}
+
+/// Whether the item has Korean or Japanese a craft-fonts face draws (so `draw` lays it out with
+/// `draw_shaped`).
+pub(super) fn has_cjk(t: &AddedText) -> bool {
+    t.text.chars().any(|c| cjk_face(t, c).is_some())
 }
 
 /// The box a text item occupies (height from its lines).
